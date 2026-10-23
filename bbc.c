@@ -1997,7 +1997,7 @@ static void generate_kernel_header(FILE *out) {
         "    bb_print_str(\"[BuildbitOS Ring-0 Hardware Probe] Direct x86 PCIe + Physical Memory Controller active.\\n\");\n"
         "}\n\n"
         "int bb_fn_main(void);\n"
-        "int64_t bb_fn_linux_syscall_dispatch(int64_t nr, int64_t a1, int64_t a2, int64_t a3);\n"
+        "__attribute__((noinline)) int64_t bb_fn_linux_syscall_dispatch(int64_t nr, int64_t a1, int64_t a2, int64_t a3);\n"
         "__attribute__((force_align_arg_pointer)) void bb_kernel_entry(void) {\n"
         "    bb_serial_init();\n"
         "    bb_fn_main();\n"

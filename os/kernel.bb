@@ -130,9 +130,11 @@ fn main() -> i32 {
     // 2. Physical Page Arena & Raw Hardware MMIO Verification
     println("[2/5] Initializing Physical Page Arena & Verifying Direct MMIO...");
     // Allocate 32 MB physical kernel arena starting at physical RAM 0x00400000
+    let m0 = cycles();
     arena kmem = 33554432;
     let page_frame_buf = alloc(kmem, u8, 65536);
     page_frame_buf[0] = 0x42;
+    let m1 = cycles();
     page_frame_buf[1] = 0x42;
 
     // Write and read back a 32-bit hardware descriptor at physical address 0x00380000
@@ -140,21 +142,24 @@ fn main() -> i32 {
     mmio_write32(mmio_phys_addr, 0xCAFEBABE);
     let mmio_val = mmio_read32(mmio_phys_addr);
     print("  Physical Arena Base       : 0x00400000 (32 MB Contiguous 64B-Aligned)\n");
+    print("  32MB Physical Arena Alloc : ");
+    print(m1 - m0);
+    println(" CPU cycles (O(1) pointer bump)");
     print("  MMIO Loopback @0x00380000 : ");
     print(mmio_val);
     println(" (Expected 3405691582 == 0xCAFEBABE)");
     println("");
 
-    // 3. SIMD SoA Process Scheduler (1,024 Concurrent Tasks)
-    println("[3/5] Starting BuildbitOS SIMD Process Scheduler (1,024 SoA Tasks)...");
-    let n_tasks = 1024;
+    // 3. SIMD SoA Process Scheduler (8,192 Concurrent Tasks)
+    println("[3/5] Starting BuildbitOS SIMD Process Scheduler (8,192 SoA Tasks)...");
+    let n_tasks = 8192;
     let tasks = alloc_soa(kmem, TaskTable, n_tasks);
 
     parallel for i in 0..n_tasks {
         let fi = i * 1.0;
         tasks[i].pid = 1000.0 + fi;
         tasks[i].state = 1.0; // TASK_RUNNING
-        tasks[i].priority = 20.0 + (fi * 0.01);
+        tasks[i].priority = 20.0 + (fi * 0.001);
         tasks[i].vruntime = 0.0;
         tasks[i].cpu_burst = 1.25;
         tasks[i].tickets = 100.0;
@@ -163,7 +168,7 @@ fn main() -> i32 {
     }
 
     let sched_c0 = cycles();
-    // Run 100 scheduler epochs across all 1,024 tasks.
+    // Run 100 scheduler epochs across all 8,192 tasks (819,200 dispatches).
     // Buildbit's Temporal Loop-Interchange Optimizer automatically fuses the
     // outer 100-epoch loop inside the SIMD task vector loop so every task's state
     // stays pinned in XMM registers for all 100 epochs!
@@ -180,18 +185,18 @@ fn main() -> i32 {
     let sched_cycles = sched_c1 - sched_c0;
     let total_vruntime = reduce_sum(tasks_vruntime, n_tasks);
 
-    print("  Scheduled 1,024 Tasks x 100 Epochs (102,400 Dispatches) in : ");
+    print("  Scheduled 8,192 Tasks x 100 Epochs (819,200 Dispatches) in : ");
     print(sched_cycles);
     println(" CPU cycles");
     print("  Cycles per Task Dispatch (SIMD SoA)                        : ");
-    let c_per_dispatch = (sched_cycles * 1.0) / 102400.0;
+    let c_per_dispatch = (sched_cycles * 1.0) / 819200.0;
     print(c_per_dispatch);
     println(" cycles/task!");
     print("  Total Accumulated Virtual Runtime Checksum                 : ");
     println(total_vruntime);
     println("");
 
-    // 4. Linux x86_64 Syscall ABI Compatibility Layer Verification
+    // 4. Linux x86_64 Syscall ABI Compatibility Layer Verification & Latency Benchmark
     println("[4/5] Executing Guest Linux x86_64 Syscall ABI Workload...");
     let uid = syscall(102);                   // __NR_getuid
     let pid = syscall(39);                    // __NR_getpid
@@ -205,6 +210,16 @@ fn main() -> i32 {
     let mmap_ptr = syscall(9, 0, 65536, 3);   // __NR_mmap(NULL, 64KB, PROT_READ|PROT_WRITE)
     let ram_kb = syscall(99, 0);              // __NR_sysinfo
 
+    // Benchmark 100,000 Linux ABI __NR_getpid (39) syscalls
+    let sys_c0 = cycles();
+    let mut pid_acc = 0;
+    for s_iter in 0..100000 {
+        pid_acc = pid_acc + syscall(39, s_iter);
+    }
+    let sys_c1 = cycles();
+    let sys_cycles = sys_c1 - sys_c0;
+    let c_per_syscall = (sys_cycles * 1.0) / 100000.0;
+
     print("  Linux ABI getuid() / getpid() : uid=");
     print(uid);
     print(" (root), pid=");
@@ -214,6 +229,13 @@ fn main() -> i32 {
     print("  Linux ABI sysinfo() RAM       : ");
     print(ram_kb / 1024);
     println(" MB Physical RAM Online");
+    print("  100,000x sys_getpid() Latency : ");
+    print(sys_cycles);
+    print(" total cycles (");
+    print(c_per_syscall);
+    print(" cycles/syscall, acc=");
+    print(pid_acc);
+    println(")");
     println("");
 
     // 5. BuildbitOS Interactive-Style Kernel Diagnostic Shell Transcript
@@ -230,7 +252,7 @@ fn main() -> i32 {
 
     let boot_t1 = cycles();
     println("  root@buildbit-os:/# dmesg | tail -n 1");
-    print("  [BuildbitOS] Complete Ring-0 Boot + 102,400 Task Dispatches + Linux ABI verified in ");
+    print("  [BuildbitOS] Complete Ring-0 Boot + 819,200 Task Dispatches + 100k Syscalls in ");
     print(boot_t1 - boot_t0);
     println(" total CPU cycles.");
     println("  root@buildbit-os:/# poweroff -f");

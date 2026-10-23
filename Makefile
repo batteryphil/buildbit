@@ -10,7 +10,24 @@ os: bbc os/kernel.bb os/linux_abi.bb
 	./bbc os/kernel.bb --kernel -o buildbit_os_kernel.elf
 
 boot-os: os
-	qemu-system-x86_64 -kernel buildbit_os_kernel.elf -m 128M -display none -serial stdio -no-reboot
+	qemu-system-x86_64 -enable-kvm -cpu host -kernel buildbit_os_kernel.elf -m 128M -display none -serial stdio -no-reboot
+
+compare-os: os os/linux_compare_init.c
+	@mkdir -p /tmp/bb_linux_initramfs
+	@$(CC) -O3 -msse2 -ffast-math -static os/linux_compare_init.c -lm -o /tmp/bb_linux_initramfs/init
+	@(cd /tmp/bb_linux_initramfs && echo init | cpio -o -H newc --quiet | gzip -9 > /tmp/linux_bench_initramfs.cpio.gz)
+	@echo "=== 1. BOOTING BUILDBIT-OS (30 KB ELF Kernel) ON QEMU/KVM ==="
+	@t0=$$(date +%s%N); \
+	qemu-system-x86_64 -enable-kvm -cpu host -kernel buildbit_os_kernel.elf -m 128M -display none -serial stdio -no-reboot; \
+	t1=$$(date +%s%N); \
+	echo ">>> BuildbitOS Total Cold-Boot-to-Poweroff Wall Time: $$(( (t1 - t0) / 1000000 )) ms"
+	@echo ""
+	@echo "=== 2. BOOTING LINUX 6.14 (vmlinuz-6.14.0-37-generic + C Initramfs) ON QEMU/KVM ==="
+	@t2=$$(date +%s%N); \
+	qemu-system-x86_64 -enable-kvm -cpu host -kernel /boot/vmlinuz-6.14.0-37-generic -initrd /tmp/linux_bench_initramfs.cpio.gz -append "console=ttyS0 quiet panic=-1" -m 128M -display none -serial stdio -no-reboot; \
+	t3=$$(date +%s%N); \
+	echo ">>> Linux 6.14 Total Cold-Boot-to-Poweroff Wall Time: $$(( (t3 - t2) / 1000000 )) ms"
+	@rm -rf /tmp/bb_linux_initramfs /tmp/linux_bench_initramfs.cpio.gz
 
 bench: bbc examples/bare_metal_bench.bb
 	./bbc examples/bare_metal_bench.bb -o bench
