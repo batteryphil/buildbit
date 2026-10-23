@@ -1,0 +1,18 @@
+# Compiled binaries & build artifacts
+bbc
+bench
+bench_freestanding
+hello_elf
+sim_c
+sim_bb_single
+sim_bb_multi
+sys_demo
+sys_demo_free
+ffi_demo
+buildbit_os
+buildbit_os_kernel.elf
+buildbit_os.iso
+*.gen.c
+*.bin
+*.o
+*.ko
