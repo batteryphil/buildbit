@@ -152,6 +152,10 @@ typedef enum {
     TOK_SYSCALL,
     TOK_MMIO_READ32,
     TOK_MMIO_WRITE32,
+    TOK_PORT_IN8,
+    TOK_PORT_OUT8,
+    TOK_PORT_IN32,
+    TOK_PORT_OUT32,
     TOK_FILE_READ,
     TOK_FILE_WRITE,
     /* Types */
@@ -344,6 +348,10 @@ static void lex(const char *src) {
             else if (strcmp(t.text, "syscall") == 0) t.kind = TOK_SYSCALL;
             else if (strcmp(t.text, "mmio_read32") == 0) t.kind = TOK_MMIO_READ32;
             else if (strcmp(t.text, "mmio_write32") == 0) t.kind = TOK_MMIO_WRITE32;
+            else if (strcmp(t.text, "port_in8") == 0) t.kind = TOK_PORT_IN8;
+            else if (strcmp(t.text, "port_out8") == 0) t.kind = TOK_PORT_OUT8;
+            else if (strcmp(t.text, "port_in32") == 0) t.kind = TOK_PORT_IN32;
+            else if (strcmp(t.text, "port_out32") == 0) t.kind = TOK_PORT_OUT32;
             else if (strcmp(t.text, "file_read") == 0) t.kind = TOK_FILE_READ;
             else if (strcmp(t.text, "file_write") == 0) t.kind = TOK_FILE_WRITE;
             else if (strcmp(t.text, "i32") == 0) t.kind = TOK_TYPE_I32;
@@ -481,6 +489,8 @@ typedef enum {
     EXPR_INTRINSIC2,
     EXPR_SYSCALL,
     EXPR_MMIO_READ32,
+    EXPR_PORT_IN8,
+    EXPR_PORT_IN32,
     EXPR_FILE_READ,
     EXPR_FILE_WRITE,
     EXPR_CALL
@@ -516,6 +526,8 @@ typedef enum {
     STMT_PRINT,
     STMT_GPU_PROBE,
     STMT_MMIO_WRITE32,
+    STMT_PORT_OUT8,
+    STMT_PORT_OUT32,
     STMT_RETURN,
     STMT_EXPR
 } StmtKind;
@@ -712,6 +724,16 @@ static Expr *parse_primary(void) {
         e->kind = EXPR_MMIO_READ32;
         e->left = parse_expr();
         expect(TOK_RPAREN, "')' after mmio_read32");
+        e->inferred_type = TYPE_I64;
+        return e;
+    }
+    if (t->kind == TOK_PORT_IN8 || t->kind == TOK_PORT_IN32) {
+        bool is32 = (t->kind == TOK_PORT_IN32);
+        advance();
+        expect(TOK_LPAREN, "'(' after port_in");
+        e->kind = is32 ? EXPR_PORT_IN32 : EXPR_PORT_IN8;
+        e->left = parse_expr();
+        expect(TOK_RPAREN, "')' after port_in");
         e->inferred_type = TYPE_I64;
         return e;
     }
@@ -1031,6 +1053,19 @@ static Stmt *parse_stmt(void) {
         return s;
     }
 
+    if (t->kind == TOK_PORT_OUT8 || t->kind == TOK_PORT_OUT32) {
+        bool is32 = (t->kind == TOK_PORT_OUT32);
+        advance();
+        expect(TOK_LPAREN, "'('");
+        s->kind = is32 ? STMT_PORT_OUT32 : STMT_PORT_OUT8;
+        s->index_expr = parse_expr();
+        expect(TOK_COMMA, "','");
+        s->expr = parse_expr();
+        expect(TOK_RPAREN, "')'");
+        if (peek()->kind == TOK_SEMICOLON) advance();
+        return s;
+    }
+
     if (t->kind == TOK_FILE_WRITE || t->kind == TOK_FILE_READ || t->kind == TOK_SYSCALL) {
         s->kind = STMT_EXPR;
         s->expr = parse_expr();
@@ -1319,6 +1354,7 @@ static void parse_program(void) {
  * ============================================================================ */
 
 static bool g_freestanding = false;
+static bool g_kernel = false;
 
 static const char *c_elem_type(DataType t) {
     if (t == TYPE_ARRAY_F32 || t == TYPE_F32) return "float";
@@ -1362,22 +1398,47 @@ static void emit_expr(FILE *out, Expr *e) {
             fprintf(out, "bb_wall_ms()");
             break;
         case EXPR_SYSCALL: {
-            fprintf(out, "bb_syscall6(");
-            for (int i = 0; i < 7; i++) {
-                if (i > 0) fprintf(out, ", ");
-                if (i < e->arg_count) {
-                    fprintf(out, "(int64_t)(");
-                    emit_expr(out, e->args[i]);
-                    fprintf(out, ")");
-                } else {
-                    fprintf(out, "0LL");
+            if (g_kernel && lookup_function("linux_syscall_dispatch")) {
+                fprintf(out, "bb_fn_linux_syscall_dispatch(");
+                for (int i = 0; i < 4; i++) {
+                    if (i > 0) fprintf(out, ", ");
+                    if (i < e->arg_count) {
+                        fprintf(out, "(int64_t)(");
+                        emit_expr(out, e->args[i]);
+                        fprintf(out, ")");
+                    } else {
+                        fprintf(out, "0LL");
+                    }
                 }
+                fprintf(out, ")");
+            } else {
+                fprintf(out, "bb_syscall6(");
+                for (int i = 0; i < 7; i++) {
+                    if (i > 0) fprintf(out, ", ");
+                    if (i < e->arg_count) {
+                        fprintf(out, "(int64_t)(");
+                        emit_expr(out, e->args[i]);
+                        fprintf(out, ")");
+                    } else {
+                        fprintf(out, "0LL");
+                    }
+                }
+                fprintf(out, ")");
             }
-            fprintf(out, ")");
             break;
         }
         case EXPR_MMIO_READ32:
             fprintf(out, "((int64_t)(*(volatile uint32_t *)(uintptr_t)(");
+            emit_expr(out, e->left);
+            fprintf(out, ")))");
+            break;
+        case EXPR_PORT_IN8:
+            fprintf(out, "((int64_t)bb_port_in8((uint16_t)(");
+            emit_expr(out, e->left);
+            fprintf(out, ")))");
+            break;
+        case EXPR_PORT_IN32:
+            fprintf(out, "((int64_t)bb_port_in32((uint16_t)(");
             emit_expr(out, e->left);
             fprintf(out, ")))");
             break;
@@ -1509,6 +1570,20 @@ static void emit_stmt(FILE *out, Stmt *s, int indent) {
             fprintf(out, ") = (uint32_t)(");
             emit_expr(out, s->expr);
             fprintf(out, ");\n");
+            break;
+        case STMT_PORT_OUT8:
+            fprintf(out, "%sbb_port_out8((uint16_t)(", pad);
+            emit_expr(out, s->index_expr);
+            fprintf(out, "), (uint8_t)(");
+            emit_expr(out, s->expr);
+            fprintf(out, "));\n");
+            break;
+        case STMT_PORT_OUT32:
+            fprintf(out, "%sbb_port_out32((uint16_t)(", pad);
+            emit_expr(out, s->index_expr);
+            fprintf(out, "), (uint32_t)(");
+            emit_expr(out, s->expr);
+            fprintf(out, "));\n");
             break;
         case STMT_LET:
             if (s->expr->kind == EXPR_ALLOC_SOA) {
@@ -1680,8 +1755,41 @@ static void emit_stmt(FILE *out, Stmt *s, int indent) {
 
 static void generate_common_syscalls_and_file_io(FILE *out) {
     fprintf(out,
+        "/* Hardware x86 Port I/O Intrinsics */\n"
+        "static inline uint8_t bb_port_in8(uint16_t port) {\n"
+        "#if defined(__x86_64__) || defined(__i386__)\n"
+        "    uint8_t val;\n"
+        "    __asm__ __volatile__ (\"inb %%1, %%0\" : \"=a\"(val) : \"Nd\"(port));\n"
+        "    return val;\n"
+        "#else\n"
+        "    (void)port; return 0;\n"
+        "#endif\n"
+        "}\n"
+        "static inline void bb_port_out8(uint16_t port, uint8_t val) {\n"
+        "#if defined(__x86_64__) || defined(__i386__)\n"
+        "    __asm__ __volatile__ (\"outb %%0, %%1\" : : \"a\"(val), \"Nd\"(port));\n"
+        "#else\n"
+        "    (void)port; (void)val;\n"
+        "#endif\n"
+        "}\n"
+        "static inline uint32_t bb_port_in32(uint16_t port) {\n"
+        "#if defined(__x86_64__) || defined(__i386__)\n"
+        "    uint32_t val;\n"
+        "    __asm__ __volatile__ (\"inl %%1, %%0\" : \"=a\"(val) : \"Nd\"(port));\n"
+        "    return val;\n"
+        "#else\n"
+        "    (void)port; return 0;\n"
+        "#endif\n"
+        "}\n"
+        "static inline void bb_port_out32(uint16_t port, uint32_t val) {\n"
+        "#if defined(__x86_64__) || defined(__i386__)\n"
+        "    __asm__ __volatile__ (\"outl %%0, %%1\" : : \"a\"(val), \"Nd\"(port));\n"
+        "#else\n"
+        "    (void)port; (void)val;\n"
+        "#endif\n"
+        "}\n\n"
         "static inline int64_t bb_syscall3(int64_t n, int64_t a1, int64_t a2, int64_t a3) {\n"
-        "    int64_t ret;\n"
+        "    int64_t ret = 0;\n"
         "#if defined(__x86_64__)\n"
         "    __asm__ __volatile__ (\"syscall\" : \"=a\"(ret) : \"a\"(n), \"D\"(a1), \"S\"(a2), \"d\"(a3) : \"rcx\", \"r11\", \"memory\");\n"
         "#elif defined(__aarch64__)\n"
@@ -1691,11 +1799,13 @@ static void generate_common_syscalls_and_file_io(FILE *out) {
         "    register int64_t x2 __asm__(\"x2\") = a3;\n"
         "    __asm__ __volatile__ (\"svc #0\" : \"+r\"(x0) : \"r\"(x8), \"r\"(x1), \"r\"(x2) : \"memory\");\n"
         "    ret = x0;\n"
+        "#else\n"
+        "    (void)n; (void)a1; (void)a2; (void)a3;\n"
         "#endif\n"
         "    return ret;\n"
         "}\n\n"
         "static inline int64_t bb_syscall6(int64_t n, int64_t a1, int64_t a2, int64_t a3, int64_t a4, int64_t a5, int64_t a6) {\n"
-        "    int64_t ret;\n"
+        "    int64_t ret = 0;\n"
         "#if defined(__x86_64__)\n"
         "    register int64_t r10 __asm__(\"r10\") = a4;\n"
         "    register int64_t r8  __asm__(\"r8\")  = a5;\n"
@@ -1711,6 +1821,8 @@ static void generate_common_syscalls_and_file_io(FILE *out) {
         "    register int64_t x5 __asm__(\"x5\") = a6;\n"
         "    __asm__ __volatile__ (\"svc #0\" : \"+r\"(x0) : \"r\"(x8), \"r\"(x1), \"r\"(x2), \"r\"(x3), \"r\"(x4), \"r\"(x5) : \"memory\");\n"
         "    ret = x0;\n"
+        "#else\n"
+        "    (void)n; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;\n"
         "#endif\n"
         "    return ret;\n"
         "}\n\n"
@@ -1718,33 +1830,179 @@ static void generate_common_syscalls_and_file_io(FILE *out) {
         "static inline int64_t bb_file_write(const char *path, const void *buf, size_t len) {\n"
         "#if defined(__x86_64__)\n"
         "    /* sys_openat(AT_FDCWD=-100, path, O_WRONLY|O_CREAT|O_TRUNC=0x241, 0644) */\n"
-        "    int64_t fd = bb_syscall6(257, -100, (int64_t)path, 0x241, 0644, 0, 0);\n"
+        "    int64_t fd = bb_syscall6(257, -100, (int64_t)(uintptr_t)path, 0x241, 0644, 0, 0);\n"
         "    if (fd < 0) return fd;\n"
-        "    int64_t wr = bb_syscall3(1, fd, (int64_t)buf, (int64_t)len);\n"
+        "    int64_t wr = bb_syscall3(1, fd, (int64_t)(uintptr_t)buf, (int64_t)len);\n"
         "    bb_syscall3(3, fd, 0, 0);\n"
         "    return wr;\n"
         "#else\n"
-        "    int64_t fd = bb_syscall6(56, -100, (int64_t)path, 0x241, 0644, 0, 0);\n"
+        "    int64_t fd = bb_syscall6(56, -100, (int64_t)(uintptr_t)path, 0x241, 0644, 0, 0);\n"
         "    if (fd < 0) return fd;\n"
-        "    int64_t wr = bb_syscall3(64, fd, (int64_t)buf, (int64_t)len);\n"
+        "    int64_t wr = bb_syscall3(64, fd, (int64_t)(uintptr_t)buf, (int64_t)len);\n"
         "    bb_syscall3(57, fd, 0, 0);\n"
         "    return wr;\n"
         "#endif\n"
         "}\n\n"
         "static inline int64_t bb_file_read(const char *path, void *buf, size_t max_len) {\n"
         "#if defined(__x86_64__)\n"
-        "    int64_t fd = bb_syscall6(257, -100, (int64_t)path, 0, 0, 0, 0);\n"
+        "    int64_t fd = bb_syscall6(257, -100, (int64_t)(uintptr_t)path, 0, 0, 0, 0);\n"
         "    if (fd < 0) return fd;\n"
-        "    int64_t rd = bb_syscall3(0, fd, (int64_t)buf, (int64_t)max_len);\n"
+        "    int64_t rd = bb_syscall3(0, fd, (int64_t)(uintptr_t)buf, (int64_t)max_len);\n"
         "    bb_syscall3(3, fd, 0, 0);\n"
         "    return rd;\n"
         "#else\n"
-        "    int64_t fd = bb_syscall6(56, -100, (int64_t)path, 0, 0, 0, 0);\n"
+        "    int64_t fd = bb_syscall6(56, -100, (int64_t)(uintptr_t)path, 0, 0, 0, 0);\n"
         "    if (fd < 0) return fd;\n"
-        "    int64_t rd = bb_syscall3(63, fd, (int64_t)buf, (int64_t)max_len);\n"
+        "    int64_t rd = bb_syscall3(63, fd, (int64_t)(uintptr_t)buf, (int64_t)max_len);\n"
         "    bb_syscall3(57, fd, 0, 0);\n"
         "    return rd;\n"
         "#endif\n"
+        "}\n\n");
+}
+
+static void generate_kernel_header(FILE *out) {
+    fprintf(out,
+        "/* Generated by Buildbit Compiler (bbc v2.0 --kernel) - Bare-Metal Ring-0 OS Kernel Runtime */\n"
+        "#include <stdint.h>\n"
+        "#include <stddef.h>\n\n"
+        "/* 1. Multiboot1 Bootloader Header + 64KB Ring-0 Stack + Hardware FPU/SSE Enable */\n"
+        "__asm__(\n"
+        "    \".section .text\\n\"\n"
+        "    \".align 4\\n\"\n"
+        "    \".long 0x1BADB002\\n\"\n"
+        "    \".long 0x00000003\\n\"\n"
+        "    \".long -(0x1BADB002 + 0x00000003)\\n\"\n"
+        "    \".global _start\\n\"\n"
+        "    \"_start:\\n\"\n"
+        "    \"    mov $bb_kernel_stack_top, %%esp\\n\"\n"
+        "    \"    and $-16, %%esp\\n\"\n"
+        "    \"    fninit\\n\"\n"
+        "    \"    mov %%cr0, %%eax\\n\"\n"
+        "    \"    and $0xFFFB, %%ax\\n\"\n"
+        "    \"    or $0x2, %%ax\\n\"\n"
+        "    \"    mov %%eax, %%cr0\\n\"\n"
+        "    \"    mov %%cr4, %%eax\\n\"\n"
+        "    \"    or $0x600, %%eax\\n\"\n"
+        "    \"    mov %%eax, %%cr4\\n\"\n"
+        "    \"    call bb_kernel_entry\\n\"\n"
+        "    \"    cli\\n\"\n"
+        "    \"1:  hlt\\n\"\n"
+        "    \"    jmp 1b\\n\"\n"
+        "    \".section .bss\\n\"\n"
+        "    \".align 16\\n\"\n"
+        "    \"bb_kernel_stack_bottom:\\n\"\n"
+        "    \".skip 65536\\n\"\n"
+        "    \"bb_kernel_stack_top:\\n\"\n"
+        "    \".section .text\\n\"\n"
+        ");\n\n");
+    generate_common_syscalls_and_file_io(out);
+    fprintf(out,
+        "/* 2. Dual-Output Bare-Metal Console: COM1 Serial (0x3F8) + VGA Text Framebuffer (0xB8000) */\n"
+        "static uint16_t * const bb_vga_fb = (uint16_t *)0xB8000;\n"
+        "static int bb_vga_row = 0;\n"
+        "static int bb_vga_col = 0;\n"
+        "static uint8_t bb_vga_color = 0x0A; /* Light green on black */\n\n"
+        "static inline void bb_serial_init(void) {\n"
+        "    bb_port_out8(0x3F8 + 1, 0x00);\n"
+        "    bb_port_out8(0x3F8 + 3, 0x80);\n"
+        "    bb_port_out8(0x3F8 + 0, 0x03);\n"
+        "    bb_port_out8(0x3F8 + 1, 0x00);\n"
+        "    bb_port_out8(0x3F8 + 3, 0x03);\n"
+        "    bb_port_out8(0x3F8 + 2, 0xC7);\n"
+        "    bb_port_out8(0x3F8 + 4, 0x0B);\n"
+        "    for (int i = 0; i < 80 * 25; i++) bb_vga_fb[i] = ((uint16_t)0x07 << 8) | ' ';\n"
+        "}\n\n"
+        "static inline void bb_kputc(char c) {\n"
+        "    while ((bb_port_in8(0x3F8 + 5) & 0x20) == 0) {}\n"
+        "    bb_port_out8(0x3F8, (uint8_t)c);\n"
+        "    if (c == '\\n') {\n"
+        "        bb_vga_col = 0;\n"
+        "        if (++bb_vga_row >= 25) bb_vga_row = 0;\n"
+        "    } else {\n"
+        "        bb_vga_fb[bb_vga_row * 80 + bb_vga_col] = ((uint16_t)bb_vga_color << 8) | (uint8_t)c;\n"
+        "        if (++bb_vga_col >= 80) {\n"
+        "            bb_vga_col = 0;\n"
+        "            if (++bb_vga_row >= 25) bb_vga_row = 0;\n"
+        "        }\n"
+        "    }\n"
+        "}\n\n"
+        "static inline void bb_print_str(const char *s) {\n"
+        "    while (*s) bb_kputc(*s++);\n"
+        "}\n\n"
+        "static inline void bb_print_i64(int64_t v, int nl) {\n"
+        "    char buf[32]; int i = 30;\n"
+        "    if (nl) buf[i--] = '\\n';\n"
+        "    uint64_t uv = (v < 0) ? (uint64_t)(-v) : (uint64_t)v;\n"
+        "    int neg = (v < 0);\n"
+        "    if (uv == 0) buf[i--] = '0';\n"
+        "    while (uv > 0) {\n"
+        "        uint64_t q = 0; uint64_t r = 0;\n"
+        "        for (int b = 63; b >= 0; b--) {\n"
+        "            r = (r << 1) | ((uv >> b) & 1ULL);\n"
+        "            if (r >= 10ULL) { r -= 10ULL; q |= (1ULL << b); }\n"
+        "        }\n"
+        "        buf[i--] = '0' + (char)r;\n"
+        "        uv = q;\n"
+        "    }\n"
+        "    if (neg) buf[i--] = '-';\n"
+        "    for (int k = i + 1; k <= 30; k++) bb_kputc(buf[k]);\n"
+        "}\n\n"
+        "static inline void bb_print_f32(double v, int nl) {\n"
+        "    int64_t whole = (int64_t)v;\n"
+        "    int64_t frac = (int64_t)((v - (double)whole) * 10000.0 + 0.5);\n"
+        "    if (frac < 0) frac = -frac;\n"
+        "    bb_print_i64(whole, 0);\n"
+        "    bb_print_str(\".\");\n"
+        "    if (frac < 1000) bb_print_str(\"0\");\n"
+        "    if (frac < 100) bb_print_str(\"0\");\n"
+        "    if (frac < 10) bb_print_str(\"0\");\n"
+        "    bb_print_i64(frac, nl);\n"
+        "}\n\n"
+        "static inline int64_t bb_rdtsc(void) {\n"
+        "    uint32_t lo, hi;\n"
+        "    __asm__ __volatile__ (\"rdtsc\" : \"=a\"(lo), \"=d\"(hi));\n"
+        "    return (int64_t)(((uint64_t)hi << 32) | lo);\n"
+        "}\n\n"
+        "static inline float bb_wall_ms(void) {\n"
+        "    return (float)((double)bb_rdtsc() / 2400000.0);\n"
+        "}\n\n"
+        "/* 3. Bare-Metal Physical Page Arena Allocator (Starts at 4 MB physical RAM: 0x00400000) */\n"
+        "typedef struct { uint8_t *base; size_t capacity; size_t offset; int gpu_backed; } bb_arena_t;\n"
+        "static uintptr_t bb_phys_bump_ptr = 0x00400000UL;\n"
+        "static inline bb_arena_t bb_arena_create(size_t bytes) {\n"
+        "    size_t aligned = (bytes + 4095UL) & ~4095UL;\n"
+        "    uint8_t *p = (uint8_t *)bb_phys_bump_ptr;\n"
+        "    bb_phys_bump_ptr += aligned;\n"
+        "    bb_arena_t a = { .base = p, .capacity = aligned, .offset = 0, .gpu_backed = 0 };\n"
+        "    return a;\n"
+        "}\n"
+        "static inline bb_arena_t bb_gpu_arena_create(size_t bytes) {\n"
+        "    return bb_arena_create(bytes);\n"
+        "}\n"
+        "static inline void *bb_arena_alloc(bb_arena_t *a, size_t bytes) {\n"
+        "    size_t aligned = (bytes + 63UL) & ~63UL;\n"
+        "    void *r = a->base + a->offset;\n"
+        "    a->offset += aligned;\n"
+        "    return __builtin_assume_aligned(r, 64);\n"
+        "}\n"
+        "static inline float bb_reduce_sum_f32(const float * __restrict__ arr, int64_t n) {\n"
+        "    const float *a = (const float *)__builtin_assume_aligned(arr, 64);\n"
+        "    float sum = 0.0f;\n"
+        "    #pragma GCC ivdep\n"
+        "    #pragma GCC unroll 8\n"
+        "    for (int64_t i = 0; i < n; ++i) sum += a[i];\n"
+        "    return sum;\n"
+        "}\n"
+        "static inline void bb_gpu_probe(void) {\n"
+        "    bb_print_str(\"[BuildbitOS Ring-0 Hardware Probe] Direct x86 PCIe + Physical Memory Controller active.\\n\");\n"
+        "}\n\n"
+        "int bb_fn_main(void);\n"
+        "int64_t bb_fn_linux_syscall_dispatch(int64_t nr, int64_t a1, int64_t a2, int64_t a3);\n"
+        "__attribute__((force_align_arg_pointer)) void bb_kernel_entry(void) {\n"
+        "    bb_serial_init();\n"
+        "    bb_fn_main();\n"
+        "    /* Trigger QEMU / Bochs / KVM ACPI Hardware Shutdown (Port 0x604 = 0x2000) */\n"
+        "    __asm__ __volatile__ (\"outw %%0, %%1\" : : \"a\"((uint16_t)0x2000), \"Nd\"((uint16_t)0x604));\n"
         "}\n\n");
 }
 
@@ -2199,7 +2457,7 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
                 "Buildbit Compiler (bbc) v2.0.0 — Systems-Complete Edition\n"
-                "Usage: bbc <source.bb> [-o <binary>] [--freestanding] [--native-elf] [--emit-c] [-l<lib>]\n");
+                "Usage: bbc <source.bb> [-o <binary>] [--kernel] [--freestanding] [--native-elf] [--emit-c] [-l<lib>]\n");
         return 1;
     }
 
@@ -2214,6 +2472,9 @@ int main(int argc, char **argv) {
             output_bin = argv[++i];
         } else if (strcmp(argv[i], "--emit-c") == 0) {
             emit_c_only = true;
+        } else if (strcmp(argv[i], "--kernel") == 0) {
+            g_kernel = true;
+            g_freestanding = true;
         } else if (strcmp(argv[i], "--freestanding") == 0) {
             g_freestanding = true;
         } else if (strcmp(argv[i], "--native-elf") == 0) {
@@ -2243,7 +2504,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (g_freestanding) {
+    if (g_kernel) {
+        generate_kernel_header(out);
+    } else if (g_freestanding) {
         generate_freestanding_header(out);
     } else {
         generate_runtime_header(out);
@@ -2265,7 +2528,11 @@ int main(int argc, char **argv) {
     }
 
     char cmd[1024];
-    if (g_freestanding) {
+    if (g_kernel) {
+        snprintf(cmd, sizeof(cmd),
+                 "gcc -m32 -O3 -msse2 -ffast-math -ffreestanding -nostdlib -fno-pie -no-pie -Wl,-Ttext=0x100000 -Wl,--build-id=none %s -o %s",
+                 c_path, output_bin);
+    } else if (g_freestanding) {
         snprintf(cmd, sizeof(cmd),
                  "gcc -O3 -march=native -mtune=native -ffast-math -nostdlib -fno-pie -no-pie -s %s -o %s",
                  c_path, output_bin);

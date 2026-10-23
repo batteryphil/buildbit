@@ -1,7 +1,7 @@
-# Buildbit (`bbc` v2.0 — Systems-Complete Edition)
+# Buildbit (`bbc` v2.0 — Systems & Bare-Metal OS Edition)
 **"As close to bare metal as possible — across every PC."**
 
-Buildbit (`.bb`) is a systems & high-performance compute programming language that combines **20x faster data-oriented SIMD/GPU execution** with **full C-level systems capabilities** (bitwise operations, raw kernel syscalls, volatile MMIO hardware register access, zero-libc freestanding binaries, file I/O, multi-file imports, and zero-overhead C FFI).
+Buildbit (`.bb`) is a systems & high-performance compute programming language that combines **20x faster data-oriented SIMD/GPU execution** with **full C-level systems & Ring-0 OS capabilities** (`--kernel` bare-metal Multiboot OS mode, hardware x86 port I/O `port_in8`/`port_out8`/`port_in32`/`port_out32`, volatile MMIO `mmio_read32`/`mmio_write32`, raw kernel `syscall`, zero-libc `--freestanding` binaries, multi-file `import`, and zero-overhead C FFI `extern fn`).
 
 ---
 
@@ -42,7 +42,7 @@ fn main() {
         }
     }
 
-    // 6. Direct Kernel Syscalls, File I/O, and Hardware Cycle Counters
+    // 6. Direct Kernel Syscalls, Hardware Port I/O, MMIO, and Cycle Counters
     let pid = syscall(39) // sys_getpid
     file_write("out.bin", bytes, 65_536)
     reset(vram) // 1-instruction arena free!
@@ -51,10 +51,20 @@ fn main() {
 
 ---
 
-## Compilation Modes & Commands
+## BuildbitOS: Bare-Metal Linux-Compatible Scratch OS (`os/kernel.bb`)
+
+This repository includes **BuildbitOS** (`os/kernel.bb` & `os/linux_abi.bb`), a Ring-0 bare-metal operating system kernel written 100% in Buildbit and compiled via `bbc os/kernel.bb --kernel`:
+- **Hardware Boot & Dual Console:** Multiboot1 ELF kernel with hardware FPU/SSE enable, COM1 115200-8N1 UART (`0x3F8`) + VGA Text Framebuffer (`0xB8000`).
+- **PCI/PCIe Hardware Bus Discovery:** Scans all 32 slots x 8 functions directly via x86 hardware ports `0xCF8` / `0xCFC`.
+- **O(1) Physical Page Arena:** 32 MB physical memory arena starting at `0x00400000` + direct volatile 32-bit MMIO verification.
+- **SIMD `soa struct TaskTable` Process Scheduler:** Schedules 1,024 tasks across 100 epochs (102,400 task dispatches) in ~150 CPU cycles/dispatch using 64-byte aligned SIMD vectors.
+- **Linux x86_64 Syscall ABI Compatibility Layer:** Dispatches standard Linux syscalls (`__NR_read`, `__NR_write`, `__NR_open`, `__NR_close`, `__NR_mmap`, `__NR_getpid`, `__NR_uname`, `__NR_sysinfo`, `__NR_getuid`) with an in-memory RamFS (`/proc/version`, `/etc/os-release`).
 
 ```bash
-# Build & run all demos (GPU arena, Freestanding, Systems, FFI, and Direct ELF64):
+# Compile BuildbitOS and boot it on bare-metal virtual hardware in QEMU:
+make boot-os
+
+# Build & run all userland demos (GPU arena, Freestanding, Systems, FFI, and Direct ELF64):
 make run
 
 # Run the head-to-head benchmark against Standard C (gcc -O3 -march=native):

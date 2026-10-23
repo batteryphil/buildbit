@@ -1,10 +1,16 @@
 CC = gcc
 CFLAGS = -O3 -Wall -Wextra -Werror
 
-all: bbc bench bench_freestanding hello_elf sim_c sim_bb_single sim_bb_multi sys_demo sys_demo_free ffi_demo
+all: bbc bench bench_freestanding hello_elf sim_c sim_bb_single sim_bb_multi sys_demo sys_demo_free ffi_demo os
 
 bbc: bbc.c
 	$(CC) $(CFLAGS) bbc.c -o bbc
+
+os: bbc os/kernel.bb os/linux_abi.bb
+	./bbc os/kernel.bb --kernel -o buildbit_os_kernel.elf
+
+boot-os: os
+	qemu-system-x86_64 -kernel buildbit_os_kernel.elf -m 128M -display none -serial stdio -no-reboot
 
 bench: bbc examples/bare_metal_bench.bb
 	./bbc examples/bare_metal_bench.bb -o bench
@@ -67,4 +73,4 @@ run: all
 	./hello_elf
 
 clean:
-	rm -f bbc bench bench_freestanding hello_elf sim_c sim_bb_single sim_bb_multi sys_demo sys_demo_free ffi_demo buildbit_test.bin *.gen.c
+	rm -f bbc bench bench_freestanding hello_elf sim_c sim_bb_single sim_bb_multi sys_demo sys_demo_free ffi_demo buildbit_os_kernel.elf buildbit_test.bin *.gen.c

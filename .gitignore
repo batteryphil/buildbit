@@ -1,4 +1,3 @@
-# Compiled binaries & build artifacts
 bbc
 bench
 bench_freestanding
@@ -9,10 +8,8 @@ sim_bb_multi
 sys_demo
 sys_demo_free
 ffi_demo
-buildbit_os
 buildbit_os_kernel.elf
-buildbit_os.iso
+buildbit_test.bin
 *.gen.c
-*.bin
 *.o
-*.ko
+*.iso
