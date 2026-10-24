@@ -1,0 +1,113 @@
+TITLE OPTIONS (Pick one depending on subreddit: r/ProgrammingLanguages, r/osdev, r/C_Programming):
+1. [Show] Buildbit: An AI-assisted experiment in a C-style systems language with automatic Struct-of-Arrays (SoA), SIMD register pinning, and a bootable 30KB bare-metal kernel
+2. I pair-programmed a 2,600-line source-to-source systems compiler (Buildbit) to see how much faster data-oriented defaults are than idiomatic C
+3. [Project] Buildbit (bbc): What happens when a tiny C transpiler enforces SoA layouts, 64B arenas, and loop fusion by default? (Full disclosure: built with AI, real benchmarks + caveats inside)
+
+================================================================================
+POST BODY (Markdown formatted for Reddit)
+================================================================================
+
+**Repo:** https://github.com/batteryphil/buildbit
+
+### Full Disclosure Up Front (AI Usage & What This Actually Is)
+
+Before making any performance claims, I want to be 100% transparent about two things:
+
+1. **How it was built:** I built this iteratively pair-programming with an AI coding agent. I'm sharing it as an open-source experiment in language design and data-oriented code generation, not claiming I spent 5 years hand-carving a compiler in a cave.
+2. **What it actually is under the hood:** Buildbit (`bbc`) is **not** a magic replacement for GCC or LLVM. It is a **2,664-line, zero-dependency C11 source-to-source compiler** (`bbc.c`) that transpiles `.bb` source files into heavily instrumented C (using GCC as its machine-code backend), plus a minimal direct x86_64 ELF64 emitter (`--native-elf`) and a 32-bit Multiboot Ring-0 kernel backend (`--kernel`).
+
+Anything Buildbit does, a senior HPC C programmer *could* write by hand in C. The entire point of Buildbit is that **almost nobody writes C that way by hand**, because the C standard forces you to manually tear apart your structs, manage pointer-aliasing provenance, and hand-roll register-tiling loops.
+
+---
+
+### Why Build It? (The Problem with Idiomatic C)
+
+When most of us write C (whether for simulations, game engines, or OS schedulers), we naturally write **Array-of-Structs (`AoS`)** and nested time-step loops:
+
+```c
+typedef struct {
+    uint32_t task_id;
+    char     label[24]; // 24 bytes of cold string sitting right in the hot struct
+    float    pos_x, pos_y, vel_x, vel_y;
+    float    stamina, priority_weight;
+} SwarmEntity;
+
+for (int epoch = 0; epoch < 100; epoch++) {
+    for (int i = 0; i < N; i++) {
+        // update entities[i]...
+    }
+}
+```
+
+Even with `gcc -O3 -march=native -ffast-math`, the C11 standard **legally forbids** GCC from fixing two huge hardware bottlenecks here:
+1. **GCC cannot change your `struct` layout:** Every cache line fetched from RAM pulls in dead fields (like `char label[24]`), and hot `float` fields are separated by a 56-byte stride instead of sitting in contiguous SIMD vectors.
+2. **GCC cannot reorder the `epoch` loop inside the `i` loop across heap pointers:** So your CPU streams all `N` structs from RAM into L1 cache **100 separate times**.
+
+---
+
+### What Buildbit (`bbc`) Does Differently
+
+Buildbit adds four first-class primitives to a simple C/Rust-like syntax and transpiles them into C that GCC can vectorize to the metal:
+
+1. **`soa struct` (Automatic Struct-of-Arrays Transposition):**
+   You still write `entities[i].pos_x` in your code, but `bbc` automatically splits the struct into separate 64-byte-aligned `__restrict__` arrays (`entities_pos_x[]`, `entities_pos_y[]`, etc.) with an inline asm pointer-provenance barrier (`__asm__("" : "+r"(ptr))`) so GCC knows distinct field arrays never alias.
+2. **Automatic Temporal Loop Fusion + 16-Lane SIMD Register Pinning (`SROA-16`):**
+   When you write `for epoch in 0..100 { parallel for i in 0..N { ... } }`, `bbc` strip-mines `i` into 16-lane aligned SIMD tiles (`float _bb_reg_*[16] __attribute__((aligned(64)))`), loads 16 elements from RAM **once**, executes all 100 epochs **100% inside AVX2/AVX-512 registers with zero RAM traffic**, and writes back to RAM **once**.
+3. **Built-in 64B `arena` and Zero-Copy AMDGPU `gpu_arena`:**
+   Instead of `malloc`/`free`, `arena` bumps a 64-byte aligned pointer in 1 instruction (using `MADV_HUGEPAGE` in userspace or physical address `0x00400000` in `--kernel` mode). `gpu_arena` talks directly to `/dev/dri/renderD128` via raw Linux `DRM_IOCTL_AMDGPU_GEM_CREATE` / `GEM_MMAP` ioctls (no ROCm/CUDA dependencies).
+4. **Bare-Metal `--freestanding` and `--kernel` Modes:**
+   - `--freestanding` compiles zero-libc Linux binaries (`-nostdlib`) using raw `syscall` instructions and `-fopenmp-simd` (which needs zero runtime library).
+   - `--kernel` compiles a bootable 30 KB Ring-0 x86 Multiboot OS kernel (`os/kernel.bb`) that boots on QEMU/KVM (`make boot-os`), enumerates PCI hardware via ports `0xCF8`/`0xCFC`, and runs a SIMD SoA process scheduler.
+
+---
+
+### Reproducible Benchmarks (Included in the Repo)
+
+You can verify all of these on your own machine (`make compare`, `make compare-swarm`, `make compare-os`). Every benchmark prints a floating-point checksum at the end to verify identical math and prevent dead-code elimination.
+
+#### 1. ECS Swarm Physics + Task Scheduler Benchmark (`make compare-swarm`)
+262,144 active entities/tasks x 100 epochs = 26.2M updates (`examples/ecs_swarm_bench.c` vs `examples/ecs_swarm_bench.bb`):
+
+| Build / Configuration | Wall Time | CPU Cycles | Checksum | Speedup |
+| :--- | :---: | :---: | :---: | :---: |
+| **C11 (`-std=c11 -O2`)** | `316.88 ms` | `948.39M` | `818825355.0` | **1.00x** |
+| **C11 (`-O3 -march=native -ffast-math`)** | `141.77 ms` | `424.30M` | `818824242.4` | **2.24x** |
+| **Buildbit 1-Core (`--freestanding`, `-nostdlib`)** | **`28.86 ms`** | **`86.35M`** | `818839104.0` | **10.98x** *(4.91x vs C `-O3`)* |
+| **Buildbit Multi-Core (`bbc` default)** | **`5.98 ms`** | **`17.88M`** | `818824320.0` | **53.03x** *(23.73x vs C `-O3`)* |
+
+#### 2. 67.1M Particle Physics + SDF Raymarching (`make compare`)
+- **Idiomatic C (`gcc -O3 -march=native -ffast-math`):** `99.94 ms`
+- **Buildbit Single-Core (`--freestanding`):** `33.24 ms` (**3.0x faster on 1 core**)
+- **Buildbit Multi-Core (`bbc` default):** `14.12 ms` (**7.1x faster**)
+
+You can inspect the exact C code `bbc` generates for any of these by passing `--emit-c`:
+```bash
+./bbc examples/ecs_swarm_bench.bb --emit-c -o inspect
+cat inspect.gen.c
+```
+
+---
+
+### The Potential Downsides & Honest Limitations
+
+I want to be just as clear about where Buildbit **falls short** or where these speedups **do not apply**:
+
+1. **No speedup on serial / pointer-chasing workloads:**
+   If your code is parsing JSON, walking binary trees, or waiting on network I/O, Buildbit is `1.0x` the speed of C (because it compiles to C). The 10x–53x gains *only* happen on data-parallel loops over arrays of structs.
+2. **Temporal Register Pinning (`SROA-16`) only works when element `i` is independent across ticks:**
+   If element `i` updates its own state across 100 ticks (or reads a static field), `bbc` can pin 16 elements in AVX registers for all 100 ticks. If element `i` needs to read element `i+1` *after every single tick* (like a coupled fluid stencil or $O(N^2)$ all-pairs check), you can't pin across epochs without syncing memory between ticks (though you still get the ~3x–10x SoA + SIMD + Multi-Core speedup).
+3. **It's a 2,664-line prototype compiler, not Zig or Rust:**
+   `bbc.c` is a single-file recursive-descent compiler built to prove out the architecture. It supports `fn`, `extern fn`, `soa struct`, `arena`, `gpu_arena`, `parallel for`, `while`, `if/else`, `syscall`, `mmio`, and `port_in/out`, but it does **not** have generics, nested complex structs, traits, DWARF source-line debugging, or a package manager.
+4. **BuildbitOS (`os/kernel.bb`) is a toy microkernel, not a full OS:**
+   While `make compare-os` boots our 30 KB `BuildbitOS` kernel in QEMU/KVM in `240 ms` and runs 819,200 SoA task dispatches at `1.55 cycles/task` (vs `217 cycles/task` in a minimal Linux 6.14 initramfs), that's because `BuildbitOS` is running a flat Ring-0 SIMD task table—it doesn't have per-process `CR3` page table isolation, virtual memory paging, ext4, or preemptive SMP locks like Linux does.
+
+---
+
+### Try It Out / Tear It Apart
+
+Everything in the repo builds with just `gcc` and `make` (`make && make run && make compare-swarm`).
+Even if you never use `.bb` syntax, running `./bbc examples/ecs_swarm_bench.bb --emit-c` is a cool way to see how much performance is sitting on the table in standard C when you combine SoA layout transposition, pointer-provenance barriers, and 16-lane SIMD register tiling.
+
+Repo link again: https://github.com/batteryphil/buildbit
+
+Happy to answer any questions or take feedback/critiques on the codegen!

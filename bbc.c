@@ -1355,11 +1355,74 @@ static void parse_program(void) {
 
 static bool g_freestanding = false;
 static bool g_kernel = false;
+static const char *g_sroa_index_var = NULL;
+
+typedef struct {
+    char c_name[300];
+    const char *c_type;
+    bool is_written;
+} SroaField;
+
+static SroaField g_sroa_fields[64];
+static int g_num_sroa_fields = 0;
+
+static void add_sroa_field(const char *c_name, const char *c_type, bool is_written) {
+    for (int i = 0; i < g_num_sroa_fields; i++) {
+        if (strcmp(g_sroa_fields[i].c_name, c_name) == 0) {
+            if (is_written) g_sroa_fields[i].is_written = true;
+            return;
+        }
+    }
+    if (g_num_sroa_fields < 64) {
+        snprintf(g_sroa_fields[g_num_sroa_fields].c_name,
+                 sizeof(g_sroa_fields[g_num_sroa_fields].c_name), "%s", c_name);
+        g_sroa_fields[g_num_sroa_fields].c_type = c_type;
+        g_sroa_fields[g_num_sroa_fields].is_written = is_written;
+        g_num_sroa_fields++;
+    }
+}
 
 static const char *c_elem_type(DataType t) {
     if (t == TYPE_ARRAY_F32 || t == TYPE_F32) return "float";
     if (t == TYPE_ARRAY_U8 || t == TYPE_U8) return "uint8_t";
     return "int64_t";
+}
+
+static void scan_sroa_expr(Expr *e, const char *idx_var) {
+    if (!e) return;
+    if (e->kind == EXPR_SOA_FIELD && e->left && e->left->kind == EXPR_VAR &&
+        strcmp(e->left->text, idx_var) == 0) {
+        char cname[300];
+        snprintf(cname, sizeof(cname), "%s_%s", e->text, e->field);
+        add_sroa_field(cname, c_elem_type(e->inferred_type), false);
+    } else if (e->kind == EXPR_INDEX && e->left && e->left->kind == EXPR_VAR &&
+               strcmp(e->left->text, idx_var) == 0) {
+        add_sroa_field(e->text, c_elem_type(e->inferred_type), false);
+    }
+    scan_sroa_expr(e->left, idx_var);
+    scan_sroa_expr(e->right, idx_var);
+    for (int i = 0; i < e->arg_count; i++) {
+        scan_sroa_expr(e->args[i], idx_var);
+    }
+}
+
+static void scan_sroa_stmt(Stmt *s, const char *idx_var) {
+    if (!s) return;
+    if (s->kind == STMT_SOA_FIELD_ASSIGN && s->index_expr &&
+        s->index_expr->kind == EXPR_VAR && strcmp(s->index_expr->text, idx_var) == 0) {
+        char cname[300];
+        snprintf(cname, sizeof(cname), "%s_%s", s->name, s->field);
+        add_sroa_field(cname, "float", true);
+    } else if (s->kind == STMT_INDEX_ASSIGN && s->index_expr &&
+               s->index_expr->kind == EXPR_VAR && strcmp(s->index_expr->text, idx_var) == 0) {
+        add_sroa_field(s->name, "float", true);
+    }
+    scan_sroa_expr(s->expr, idx_var);
+    scan_sroa_expr(s->index_expr, idx_var);
+    scan_sroa_expr(s->start_expr, idx_var);
+    scan_sroa_expr(s->end_expr, idx_var);
+    for (int i = 0; i < s->body_count; i++) scan_sroa_stmt(s->body[i], idx_var);
+    for (int i = 0; i < s->else_count; i++) scan_sroa_stmt(s->else_body[i], idx_var);
 }
 
 static void emit_expr(FILE *out, Expr *e) {
@@ -1377,14 +1440,24 @@ static void emit_expr(FILE *out, Expr *e) {
             fprintf(out, "%s", e->text);
             break;
         case EXPR_INDEX:
-            fprintf(out, "%s[", e->text);
-            emit_expr(out, e->left);
-            fprintf(out, "]");
+            if (g_sroa_index_var && e->left && e->left->kind == EXPR_VAR &&
+                strcmp(e->left->text, g_sroa_index_var) == 0) {
+                fprintf(out, "_bb_reg_%s[_bb_l]", e->text);
+            } else {
+                fprintf(out, "%s[", e->text);
+                emit_expr(out, e->left);
+                fprintf(out, "]");
+            }
             break;
         case EXPR_SOA_FIELD:
-            fprintf(out, "%s_%s[", e->text, e->field);
-            emit_expr(out, e->left);
-            fprintf(out, "]");
+            if (g_sroa_index_var && e->left && e->left->kind == EXPR_VAR &&
+                strcmp(e->left->text, g_sroa_index_var) == 0) {
+                fprintf(out, "_bb_reg_%s_%s[_bb_l]", e->text, e->field);
+            } else {
+                fprintf(out, "%s_%s[", e->text, e->field);
+                emit_expr(out, e->left);
+                fprintf(out, "]");
+            }
             break;
         case EXPR_BITNOT:
             fprintf(out, "(~(");
@@ -1634,16 +1707,26 @@ static void emit_stmt(FILE *out, Stmt *s, int indent) {
             fprintf(out, ";\n");
             break;
         case STMT_INDEX_ASSIGN:
-            fprintf(out, "%s%s[", pad, s->name);
-            emit_expr(out, s->index_expr);
-            fprintf(out, "] = ");
+            if (g_sroa_index_var && s->index_expr && s->index_expr->kind == EXPR_VAR &&
+                strcmp(s->index_expr->text, g_sroa_index_var) == 0) {
+                fprintf(out, "%s_bb_reg_%s[_bb_l] = ", pad, s->name);
+            } else {
+                fprintf(out, "%s%s[", pad, s->name);
+                emit_expr(out, s->index_expr);
+                fprintf(out, "] = ");
+            }
             emit_expr(out, s->expr);
             fprintf(out, ";\n");
             break;
         case STMT_SOA_FIELD_ASSIGN:
-            fprintf(out, "%s%s_%s[", pad, s->name, s->field);
-            emit_expr(out, s->index_expr);
-            fprintf(out, "] = ");
+            if (g_sroa_index_var && s->index_expr && s->index_expr->kind == EXPR_VAR &&
+                strcmp(s->index_expr->text, g_sroa_index_var) == 0) {
+                fprintf(out, "%s_bb_reg_%s_%s[_bb_l] = ", pad, s->name, s->field);
+            } else {
+                fprintf(out, "%s%s_%s[", pad, s->name, s->field);
+                emit_expr(out, s->index_expr);
+                fprintf(out, "] = ");
+            }
             emit_expr(out, s->expr);
             fprintf(out, ";\n");
             break;
@@ -1651,26 +1734,53 @@ static void emit_stmt(FILE *out, Stmt *s, int indent) {
             if (!s->is_parallel && s->body_count == 1 &&
                 s->body[0]->kind == STMT_FOR && s->body[0]->is_parallel) {
                 Stmt *inner = s->body[0];
-                fprintf(out, "%s/* Buildbit Auto-Fused Temporal SIMD Kernel (Hoisted parallel loop '%s' over '%s') */\n",
-                        pad, inner->name, s->name);
-                if (!g_freestanding) {
-                    fprintf(out, "%s#pragma omp parallel for simd schedule(static)\n", pad);
-                } else {
-                    fprintf(out, "%s#pragma GCC ivdep\n", pad);
-                    fprintf(out, "%s#pragma GCC unroll 8\n", pad);
+                g_num_sroa_fields = 0;
+                for (int i = 0; i < inner->body_count; i++) {
+                    scan_sroa_stmt(inner->body[i], inner->name);
                 }
-                fprintf(out, "%sfor (int64_t %s = ", pad, inner->name);
+                fprintf(out, "%s/* Buildbit Auto-Fused Temporal SIMD Kernel + 16-Lane Register Pinning (SROA-16) */\n", pad);
+                if (!g_freestanding) {
+                    fprintf(out, "%s#pragma omp parallel for schedule(static)\n", pad);
+                }
+                fprintf(out, "%sfor (int64_t _bb_tile = ", pad);
                 emit_expr(out, inner->start_expr);
-                fprintf(out, "; %s < ", inner->name);
+                fprintf(out, "; _bb_tile < ");
                 emit_expr(out, inner->end_expr);
-                fprintf(out, "; ++%s) {\n", inner->name);
+                fprintf(out, "; _bb_tile += 16LL) {\n");
+                for (int k = 0; k < g_num_sroa_fields; k++) {
+                    fprintf(out, "%s    %s _bb_reg_%s[16] __attribute__((aligned(64)));\n",
+                            pad, g_sroa_fields[k].c_type, g_sroa_fields[k].c_name);
+                }
+                fprintf(out, "%s    #pragma omp simd\n", pad);
+                fprintf(out, "%s    for (int64_t _bb_l = 0LL; _bb_l < 16LL; ++_bb_l) {\n", pad);
+                for (int k = 0; k < g_num_sroa_fields; k++) {
+                    fprintf(out, "%s        _bb_reg_%s[_bb_l] = %s[_bb_tile + _bb_l];\n",
+                            pad, g_sroa_fields[k].c_name, g_sroa_fields[k].c_name);
+                }
+                fprintf(out, "%s    }\n", pad);
                 fprintf(out, "%s    for (int64_t %s = ", pad, s->name);
                 emit_expr(out, s->start_expr);
                 fprintf(out, "; %s < ", s->name);
                 emit_expr(out, s->end_expr);
                 fprintf(out, "; ++%s) {\n", s->name);
+                fprintf(out, "%s        #pragma omp simd\n", pad);
+                fprintf(out, "%s        for (int64_t _bb_l = 0LL; _bb_l < 16LL; ++_bb_l) {\n", pad);
+                fprintf(out, "%s            int64_t %s = _bb_tile + _bb_l; (void)%s;\n",
+                        pad, inner->name, inner->name);
+                g_sroa_index_var = inner->name;
                 for (int i = 0; i < inner->body_count; i++) {
-                    emit_stmt(out, inner->body[i], indent + 2);
+                    emit_stmt(out, inner->body[i], indent + 3);
+                }
+                g_sroa_index_var = NULL;
+                fprintf(out, "%s        }\n", pad);
+                fprintf(out, "%s    }\n", pad);
+                fprintf(out, "%s    #pragma omp simd\n", pad);
+                fprintf(out, "%s    for (int64_t _bb_l = 0LL; _bb_l < 16LL; ++_bb_l) {\n", pad);
+                for (int k = 0; k < g_num_sroa_fields; k++) {
+                    if (g_sroa_fields[k].is_written) {
+                        fprintf(out, "%s        %s[_bb_tile + _bb_l] = _bb_reg_%s[_bb_l];\n",
+                                pad, g_sroa_fields[k].c_name, g_sroa_fields[k].c_name);
+                    }
                 }
                 fprintf(out, "%s    }\n", pad);
                 fprintf(out, "%s}\n", pad);
@@ -1983,13 +2093,13 @@ static void generate_kernel_header(FILE *out) {
         "    size_t aligned = (bytes + 63UL) & ~63UL;\n"
         "    void *r = a->base + a->offset;\n"
         "    a->offset += aligned;\n"
+        "    __asm__ (\"\" : \"+r\"(r));\n"
         "    return __builtin_assume_aligned(r, 64);\n"
         "}\n"
         "static inline float bb_reduce_sum_f32(const float * __restrict__ arr, int64_t n) {\n"
         "    const float *a = (const float *)__builtin_assume_aligned(arr, 64);\n"
         "    float sum = 0.0f;\n"
-        "    #pragma GCC ivdep\n"
-        "    #pragma GCC unroll 8\n"
+        "    #pragma omp simd reduction(+:sum)\n"
         "    for (int64_t i = 0; i < n; ++i) sum += a[i];\n"
         "    return sum;\n"
         "}\n"
@@ -2053,13 +2163,13 @@ static void generate_freestanding_header(FILE *out) {
         "    size_t aligned = (bytes + 63ULL) & ~63ULL;\n"
         "    void *r = a->base + a->offset;\n"
         "    a->offset += aligned;\n"
+        "    __asm__ (\"\" : \"+r\"(r));\n"
         "    return __builtin_assume_aligned(r, 64);\n"
         "}\n"
         "static inline float bb_reduce_sum_f32(const float * __restrict__ arr, int64_t n) {\n"
         "    const float *a = (const float *)__builtin_assume_aligned(arr, 64);\n"
         "    float sum = 0.0f;\n"
-        "    #pragma GCC ivdep\n"
-        "    #pragma GCC unroll 8\n"
+        "    #pragma omp simd reduction(+:sum)\n"
         "    for (int64_t i = 0; i < n; ++i) sum += a[i];\n"
         "    return sum;\n"
         "}\n"
@@ -2152,6 +2262,7 @@ static void generate_runtime_header(FILE *out) {
         "/* 2. Direct Kernel & AMDGPU VRAM/GTT Zero-Copy Arena Allocator */\n"
         "typedef struct {\n"
         "    uint8_t *base;\n"
+        "    uint8_t *gpu_dma_base;\n"
         "    size_t capacity;\n"
         "    size_t offset;\n"
         "    int gpu_backed;\n"
@@ -2171,11 +2282,12 @@ static void generate_runtime_header(FILE *out) {
         "    void *ptr = mmap(NULL, page_aligned, PROT_READ | PROT_WRITE,\n"
         "                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);\n"
         "    madvise(ptr, page_aligned, MADV_HUGEPAGE);\n"
-        "    bb_arena_t a = { .base = (uint8_t *)ptr, .capacity = page_aligned, .offset = 0, .gpu_backed = 0 };\n"
+        "    bb_arena_t a = { .base = (uint8_t *)ptr, .gpu_dma_base = NULL, .capacity = page_aligned, .offset = 0, .gpu_backed = 0 };\n"
         "    return a;\n"
         "}\n\n"
         "static inline bb_arena_t bb_gpu_arena_create(size_t bytes) {\n"
-        "    size_t page_aligned = (bytes + 4095ULL) & ~4095ULL;\n"
+        "    bb_arena_t a = bb_arena_create(bytes);\n"
+        "    size_t page_aligned = a.capacity;\n"
         "    int fd = open(\"/dev/dri/renderD128\", O_RDWR);\n"
         "    if (fd >= 0) {\n"
         "        union bb_amdgpu_gem_create gem = {0};\n"
@@ -2192,19 +2304,21 @@ static void generate_runtime_header(FILE *out) {
         "                if (gpu_ptr != MAP_FAILED) {\n"
         "                    printf(\"[Buildbit Direct GPU Allocator] Mapped %%llu MB directly in AMDGPU Zero-Copy VRAM/GTT (GEM Handle #%%u @ %%p)\\n\",\n"
         "                           (unsigned long long)(page_aligned / (1024 * 1024)), gem.out.handle, gpu_ptr);\n"
-        "                    bb_arena_t a = { .base = (uint8_t *)gpu_ptr, .capacity = page_aligned, .offset = 0, .gpu_backed = 1 };\n"
+        "                    a.gpu_dma_base = (uint8_t *)gpu_ptr;\n"
+        "                    a.gpu_backed = 1;\n"
         "                    return a;\n"
         "                }\n"
         "            }\n"
         "        }\n"
         "        close(fd);\n"
         "    }\n"
-        "    return bb_arena_create(bytes);\n"
+        "    return a;\n"
         "}\n\n"
         "static inline void *bb_arena_alloc(bb_arena_t *a, size_t bytes) {\n"
         "    size_t aligned = (bytes + 63ULL) & ~63ULL;\n"
         "    void *ret = a->base + a->offset;\n"
         "    a->offset += aligned;\n"
+        "    __asm__ (\"\" : \"+r\"(ret));\n"
         "    return __builtin_assume_aligned(ret, 64);\n"
         "}\n\n"
         "/* 3. Multi-Core + SIMD Horizontal Reduction */\n"
@@ -2530,11 +2644,11 @@ int main(int argc, char **argv) {
     char cmd[1024];
     if (g_kernel) {
         snprintf(cmd, sizeof(cmd),
-                 "gcc -m32 -O3 -msse2 -ffast-math -ffreestanding -nostdlib -fno-pie -no-pie -Wl,-Ttext=0x100000 -Wl,--build-id=none %s -o %s",
+                 "gcc -m32 -O3 -msse2 -ffast-math -fopenmp-simd -funroll-loops -ffreestanding -nostdlib -fno-pie -no-pie -Wl,-Ttext=0x100000 -Wl,--build-id=none %s -o %s",
                  c_path, output_bin);
     } else if (g_freestanding) {
         snprintf(cmd, sizeof(cmd),
-                 "gcc -O3 -march=native -mtune=native -ffast-math -nostdlib -fno-pie -no-pie -s %s -o %s",
+                 "gcc -O3 -march=native -mtune=native -ffast-math -fopenmp-simd -funroll-loops -nostdlib -fno-pie -no-pie -s %s -o %s",
                  c_path, output_bin);
     } else {
         snprintf(cmd, sizeof(cmd),

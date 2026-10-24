@@ -89,5 +89,22 @@ run: all
 	@echo "--- 5. Direct x86_64 ELF64 Machine-Code Emitter Mode (Zero GCC/LD) ---"
 	./hello_elf
 
+compare-swarm: bbc examples/ecs_swarm_bench.c examples/ecs_swarm_bench.bb
+	$(CC) -std=c11 -O2 examples/ecs_swarm_bench.c -o swarm_c_o2 -lm
+	$(CC) -std=c11 -O3 -march=native -ffast-math examples/ecs_swarm_bench.c -o swarm_c_o3 -lm
+	./bbc examples/ecs_swarm_bench.bb --freestanding -o swarm_bb_1core
+	./bbc examples/ecs_swarm_bench.bb -o swarm_bb_full
+	@echo "=== 1. Standard C11 AoS (gcc -std=c11 -O2) ==="
+	./swarm_c_o2
+	@echo ""
+	@echo "=== 2. Max GCC C11 AoS (gcc -std=c11 -O3 -march=native -ffast-math) ==="
+	./swarm_c_o3
+	@echo ""
+	@echo "=== 3. Buildbit 1-Core (--freestanding SoA + SROA-16 SIMD Register Pinning) ==="
+	./swarm_bb_1core
+	@echo ""
+	@echo "=== 4. Buildbit Default (Multi-Core + SoA + SROA-16 SIMD + AMDGPU gpu_arena) ==="
+	./swarm_bb_full
+
 clean:
-	rm -f bbc bench bench_freestanding hello_elf sim_c sim_bb_single sim_bb_multi sys_demo sys_demo_free ffi_demo buildbit_os_kernel.elf buildbit_test.bin *.gen.c
+	rm -f bbc bench bench_freestanding hello_elf sim_c sim_bb_single sim_bb_multi sys_demo sys_demo_free ffi_demo buildbit_os_kernel.elf buildbit_test.bin swarm_c_o2 swarm_c_o3 swarm_bb_1core swarm_bb_full *.gen.c
