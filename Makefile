@@ -1,13 +1,38 @@
 CC = gcc
 CFLAGS = -O3 -Wall -Wextra -Werror
 
-all: bbc bench bench_freestanding hello_elf sim_c sim_bb_single sim_bb_multi sys_demo sys_demo_free ffi_demo os
+all: bbc bench bench_freestanding hello_elf sim_c sim_bb_single sim_bb_multi sys_demo sys_demo_free ffi_demo os gpu_os gpu_desktop
 
 bbc: bbc.c
 	$(CC) $(CFLAGS) bbc.c -o bbc
 
+gpu_os: bbc os/gpu_os.bb os/gpu_vfs.bb
+	./bbc os/gpu_os.bb -lX11 -lm -o gpu_os
+
+gpu_desktop: bbc os/gpu_desktop.bb os/gpu_vfs.bb os/gpu_mint_gui.h
+	./bbc os/gpu_desktop.bb -lX11 -lm -o gpu_desktop
+
+boot-mint-gpu: gpu_desktop
+	./gpu_desktop
+
+boot-gpu-os: gpu_os
+	./gpu_os
+
 os: bbc os/kernel.bb os/linux_abi.bb
 	./bbc os/kernel.bb --kernel -o buildbit_os_kernel.elf
+
+gui_kernel: bbc os/kernel_gui.bb os/linux_abi.bb os/baremetal_gui.h
+	./bbc os/kernel_gui.bb --kernel -o buildbit_gui_kernel.elf
+
+gui_iso: gui_kernel
+	mkdir -p /tmp/bb_iso_root/boot/grub
+	cp buildbit_gui_kernel.elf /tmp/bb_iso_root/boot/buildbit_gui_kernel.elf
+	printf 'set timeout=0\nset default=0\nmenuentry "BuildbitOS v2.3.0 (Ring-0 1280x720 VBE Graphical Desktop)" {\n    multiboot /boot/buildbit_gui_kernel.elf\n    boot\n}\n' > /tmp/bb_iso_root/boot/grub/grub.cfg
+	grub-mkrescue -o buildbit_gui_os.iso /tmp/bb_iso_root 2>/dev/null
+	rm -rf /tmp/bb_iso_root
+
+boot-gui-iso: gui_iso
+	qemu-system-x86_64 -enable-kvm -cpu host -m 256M -vga std -cdrom buildbit_gui_os.iso -serial stdio -no-reboot
 
 boot-os: os
 	qemu-system-x86_64 -enable-kvm -cpu host -kernel buildbit_os_kernel.elf -m 128M -display none -serial stdio -no-reboot
@@ -106,5 +131,23 @@ compare-swarm: bbc examples/ecs_swarm_bench.c examples/ecs_swarm_bench.bb
 	@echo "=== 4. Buildbit Default (Multi-Core + SoA + SROA-16 SIMD + AMDGPU gpu_arena) ==="
 	./swarm_bb_full
 
+compare-gpu-os: bbc examples/gpu_os_coupled_bench.c examples/gpu_os_coupled_bench.bb
+	$(CC) -std=c11 -O2 examples/gpu_os_coupled_bench.c -o gpu_os_c_o2 -lm
+	$(CC) -std=c11 -O3 -march=native -ffast-math examples/gpu_os_coupled_bench.c -o gpu_os_c_o3 -lm
+	./bbc examples/gpu_os_coupled_bench.bb -o gpu_os_bb_cpu
+	./bbc examples/gpu_os_coupled_bench.bb --gpu -o gpu_os_bb_gpu
+	@echo "=== 1. Traditional Linux C11 AoS (gcc -std=c11 -O2) ==="
+	./gpu_os_c_o2
+	@echo ""
+	@echo "=== 2. Max GCC Linux C11 AoS (gcc -std=c11 -O3 -march=native -ffast-math) ==="
+	./gpu_os_c_o3
+	@echo ""
+	@echo "=== 3. Buildbit CPU (24-Thread OpenMP + AVX2 SIMD + SoA) ==="
+	./gpu_os_bb_cpu
+	@echo ""
+	@echo "=== 4. Buildbit GPU-Resident OS (--gpu Radeon RX 9060 XT GDDR6 VRAM) ==="
+	./gpu_os_bb_gpu
+
 clean:
-	rm -f bbc bench bench_freestanding hello_elf sim_c sim_bb_single sim_bb_multi sys_demo sys_demo_free ffi_demo buildbit_os_kernel.elf buildbit_test.bin swarm_c_o2 swarm_c_o3 swarm_bb_1core swarm_bb_full *.gen.c
+	rm -rf bbc bench bench_freestanding hello_elf sim_c sim_bb_single sim_bb_multi sys_demo sys_demo_free ffi_demo buildbit_os_kernel.elf buildbit_test.bin swarm_c_o2 swarm_c_o3 swarm_bb_1core swarm_bb_full gpu_os_c_o2 gpu_os_c_o3 gpu_os_bb_cpu gpu_os_bb_gpu build *.gen.c
+

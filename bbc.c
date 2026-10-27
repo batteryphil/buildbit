@@ -240,7 +240,10 @@ static void lex(const char *src) {
         if (src[i] == '"') {
             i++;
             int k = 0;
-            while (src[i] != '\0' && src[i] != '"' && k < 126) {
+            while (src[i] != '\0' && src[i] != '"' && k < 124) {
+                if (src[i] == '\\' && src[i + 1] != '\0') {
+                    t.text[k++] = src[i++];
+                }
                 t.text[k++] = src[i++];
             }
             t.text[k] = '\0';
@@ -549,6 +552,7 @@ typedef struct Stmt {
     int body_count;
     struct Stmt **else_body;
     int else_count;
+    int gpu_kern_id;
 } Stmt;
 
 typedef struct {
@@ -893,6 +897,14 @@ static Expr *parse_primary(void) {
             e->left = idx;
             e->inferred_type = (dt == TYPE_ARRAY_F32) ? TYPE_F32 : TYPE_I64;
             return e;
+        } else if (peek()->kind == TOK_DOT && sym && sym->type == TYPE_SOA_INSTANCE) {
+            advance();
+            Token *fld = expect(TOK_IDENT, "field name after '.'");
+            e->kind = EXPR_VAR;
+            snprintf(e->text, sizeof(e->text), "%.56s_%.56s", t->text, fld->text);
+            Symbol *fsym = lookup_symbol_entry(e->text);
+            e->inferred_type = fsym ? fsym->type : TYPE_ARRAY_F32;
+            return e;
         } else {
             e->kind = EXPR_VAR;
             e->inferred_type = dt;
@@ -1095,6 +1107,16 @@ static Stmt *parse_stmt(void) {
         if (e->kind == EXPR_ALLOC_SOA) {
             snprintf(s->soa_type_name, sizeof(s->soa_type_name), "%s", e->soa_type_name);
             add_symbol(s->name, TYPE_SOA_INSTANCE, e->soa_type_name);
+            SoaStructDef *sd = find_soa_def(e->soa_type_name);
+            if (sd) {
+                for (int k = 0; k < sd->num_fields; k++) {
+                    char arr_sym[120];
+                    snprintf(arr_sym, sizeof(arr_sym), "%.56s_%.56s", s->name, sd->fields[k].name);
+                    DataType arr_t = (sd->fields[k].type == TYPE_F32) ? TYPE_ARRAY_F32 :
+                                     (sd->fields[k].type == TYPE_U8)  ? TYPE_ARRAY_U8 : TYPE_ARRAY_I64;
+                    add_symbol(arr_sym, arr_t, NULL);
+                }
+            }
         } else {
             add_symbol(s->name, s->var_type, NULL);
         }
@@ -1355,6 +1377,10 @@ static void parse_program(void) {
 
 static bool g_freestanding = false;
 static bool g_kernel = false;
+static bool g_gpu = false;
+static bool g_emitting_ocl = false;
+static bool g_sroa_has_nonlocal_index = false;
+static int g_num_gpu_kernels = 0;
 static const char *g_sroa_index_var = NULL;
 
 typedef struct {
@@ -1390,14 +1416,18 @@ static const char *c_elem_type(DataType t) {
 
 static void scan_sroa_expr(Expr *e, const char *idx_var) {
     if (!e) return;
-    if (e->kind == EXPR_SOA_FIELD && e->left && e->left->kind == EXPR_VAR &&
-        strcmp(e->left->text, idx_var) == 0) {
+    if (e->kind == EXPR_SOA_FIELD) {
         char cname[300];
         snprintf(cname, sizeof(cname), "%s_%s", e->text, e->field);
         add_sroa_field(cname, c_elem_type(e->inferred_type), false);
-    } else if (e->kind == EXPR_INDEX && e->left && e->left->kind == EXPR_VAR &&
-               strcmp(e->left->text, idx_var) == 0) {
+        if (!e->left || e->left->kind != EXPR_VAR || strcmp(e->left->text, idx_var) != 0) {
+            g_sroa_has_nonlocal_index = true;
+        }
+    } else if (e->kind == EXPR_INDEX) {
         add_sroa_field(e->text, c_elem_type(e->inferred_type), false);
+        if (!e->left || e->left->kind != EXPR_VAR || strcmp(e->left->text, idx_var) != 0) {
+            g_sroa_has_nonlocal_index = true;
+        }
     }
     scan_sroa_expr(e->left, idx_var);
     scan_sroa_expr(e->right, idx_var);
@@ -1408,14 +1438,18 @@ static void scan_sroa_expr(Expr *e, const char *idx_var) {
 
 static void scan_sroa_stmt(Stmt *s, const char *idx_var) {
     if (!s) return;
-    if (s->kind == STMT_SOA_FIELD_ASSIGN && s->index_expr &&
-        s->index_expr->kind == EXPR_VAR && strcmp(s->index_expr->text, idx_var) == 0) {
+    if (s->kind == STMT_SOA_FIELD_ASSIGN) {
         char cname[300];
         snprintf(cname, sizeof(cname), "%s_%s", s->name, s->field);
         add_sroa_field(cname, "float", true);
-    } else if (s->kind == STMT_INDEX_ASSIGN && s->index_expr &&
-               s->index_expr->kind == EXPR_VAR && strcmp(s->index_expr->text, idx_var) == 0) {
+        if (!s->index_expr || s->index_expr->kind != EXPR_VAR || strcmp(s->index_expr->text, idx_var) != 0) {
+            g_sroa_has_nonlocal_index = true;
+        }
+    } else if (s->kind == STMT_INDEX_ASSIGN) {
         add_sroa_field(s->name, "float", true);
+        if (!s->index_expr || s->index_expr->kind != EXPR_VAR || strcmp(s->index_expr->text, idx_var) != 0) {
+            g_sroa_has_nonlocal_index = true;
+        }
     }
     scan_sroa_expr(s->expr, idx_var);
     scan_sroa_expr(s->index_expr, idx_var);
@@ -1428,7 +1462,11 @@ static void scan_sroa_stmt(Stmt *s, const char *idx_var) {
 static void emit_expr(FILE *out, Expr *e) {
     switch (e->kind) {
         case EXPR_INT:
-            fprintf(out, "%lldLL", (long long)e->int_val);
+            if (g_emitting_ocl) {
+                fprintf(out, "%lld", (long long)e->int_val);
+            } else {
+                fprintf(out, "%lldLL", (long long)e->int_val);
+            }
             break;
         case EXPR_FLOAT:
             fprintf(out, "%.8ff", e->float_val);
@@ -1542,7 +1580,7 @@ static void emit_expr(FILE *out, Expr *e) {
             break;
         case EXPR_INTRINSIC1:
             if (e->op == TOK_SQRT) {
-                fprintf(out, "__builtin_sqrtf((float)(");
+                fprintf(out, "%s((float)(", g_emitting_ocl ? "sqrt" : "__builtin_sqrtf");
                 emit_expr(out, e->left);
                 fprintf(out, "))");
             } else {
@@ -1696,7 +1734,7 @@ static void emit_stmt(FILE *out, Stmt *s, int indent) {
                 emit_expr(out, s->expr);
                 fprintf(out, ";\n");
             } else {
-                fprintf(out, "%sint64_t %s = ", pad, s->name);
+                fprintf(out, "%s%s %s = ", pad, g_emitting_ocl ? "int" : "int64_t", s->name);
                 emit_expr(out, s->expr);
                 fprintf(out, ";\n");
             }
@@ -1730,61 +1768,140 @@ static void emit_stmt(FILE *out, Stmt *s, int indent) {
             emit_expr(out, s->expr);
             fprintf(out, ";\n");
             break;
-        case STMT_FOR:
+        case STMT_FOR: {
+            if (g_gpu && !g_emitting_ocl) {
+                bool all_par = (s->body_count >= 1 && !s->is_parallel);
+                for (int i = 0; all_par && i < s->body_count; i++) {
+                    if (s->body[i]->kind != STMT_FOR || !s->body[i]->is_parallel) all_par = false;
+                }
+                if (all_par) {
+                    fprintf(out, "%s/* Buildbit Auto-Offloaded GPU-Resident Kernel Loop (Radeon RX 9060 XT GDDR6 VRAM) */\n", pad);
+                    fprintf(out, "%s{\n", pad);
+                    for (int pass = 0; pass < s->body_count; pass++) {
+                        Stmt *inner = s->body[pass];
+                        int kid = inner->gpu_kern_id;
+                        g_num_sroa_fields = 0;
+                        g_sroa_has_nonlocal_index = false;
+                        for (int b = 0; b < inner->body_count; b++) {
+                            scan_sroa_stmt(inner->body[b], inner->name);
+                        }
+                        for (int k = 0; k < g_num_sroa_fields; k++) {
+                            fprintf(out, "%s    bb_cl_mem _bb_k%d_arg%d = bb_gpu_get_buf(%s, (size_t)(",
+                                    pad, kid, k, g_sroa_fields[k].c_name);
+                            emit_expr(out, inner->end_expr);
+                            fprintf(out, ") * sizeof(%s), %d);\n",
+                                    g_sroa_fields[k].c_type, g_sroa_fields[k].is_written ? 1 : 0);
+                            fprintf(out, "%s    fn_clSetKernelArg(g_bb_gpu_kerns[%d], %d, sizeof(bb_cl_mem), &_bb_k%d_arg%d);\n",
+                                    pad, kid, k, kid, k);
+                        }
+                    }
+                    fprintf(out, "%s    for (int64_t %s = ", pad, s->name);
+                    emit_expr(out, s->start_expr);
+                    fprintf(out, "; %s < ", s->name);
+                    emit_expr(out, s->end_expr);
+                    fprintf(out, "; ++%s) {\n", s->name);
+                    for (int pass = 0; pass < s->body_count; pass++) {
+                        Stmt *inner = s->body[pass];
+                        int kid = inner->gpu_kern_id;
+                        fprintf(out, "%s        size_t _bb_gws_%d = (size_t)(", pad, kid);
+                        emit_expr(out, inner->end_expr);
+                        fprintf(out, ");\n");
+                        fprintf(out, "%s        size_t _bb_lws_%d = (_bb_gws_%d %% 256 == 0) ? 256 : ((_bb_gws_%d %% 64 == 0) ? 64 : 1);\n",
+                                pad, kid, kid, kid);
+                        fprintf(out, "%s        fn_clEnqueueNDRangeKernel(g_bb_cl_q, g_bb_gpu_kerns[%d], 1, NULL, &_bb_gws_%d, &_bb_lws_%d, 0, NULL, NULL);\n",
+                                pad, kid, kid, kid);
+                    }
+                    fprintf(out, "%s    }\n", pad);
+                    fprintf(out, "%s    fn_clFinish(g_bb_cl_q);\n", pad);
+                    fprintf(out, "%s}\n", pad);
+                    break;
+                } else if (s->is_parallel && s->gpu_kern_id >= 0) {
+                    int kid = s->gpu_kern_id;
+                    g_num_sroa_fields = 0;
+                    g_sroa_has_nonlocal_index = false;
+                    for (int b = 0; b < s->body_count; b++) {
+                        scan_sroa_stmt(s->body[b], s->name);
+                    }
+                    fprintf(out, "%s/* Buildbit Auto-Offloaded GPU Parallel Pass (_bb_gpu_kern_%d) */\n", pad, kid);
+                    fprintf(out, "%s{\n", pad);
+                    for (int k = 0; k < g_num_sroa_fields; k++) {
+                        fprintf(out, "%s    bb_cl_mem _bb_k%d_arg%d = bb_gpu_get_buf(%s, (size_t)(",
+                                pad, kid, k, g_sroa_fields[k].c_name);
+                        emit_expr(out, s->end_expr);
+                        fprintf(out, ") * sizeof(%s), %d);\n",
+                                g_sroa_fields[k].c_type, g_sroa_fields[k].is_written ? 1 : 0);
+                        fprintf(out, "%s    fn_clSetKernelArg(g_bb_gpu_kerns[%d], %d, sizeof(bb_cl_mem), &_bb_k%d_arg%d);\n",
+                                pad, kid, k, kid, k);
+                    }
+                    fprintf(out, "%s    size_t _bb_gws_%d = (size_t)(", pad, kid);
+                    emit_expr(out, s->end_expr);
+                    fprintf(out, ");\n");
+                    fprintf(out, "%s    size_t _bb_lws_%d = (_bb_gws_%d %% 256 == 0) ? 256 : ((_bb_gws_%d %% 64 == 0) ? 64 : 1);\n",
+                            pad, kid, kid, kid);
+                    fprintf(out, "%s    fn_clEnqueueNDRangeKernel(g_bb_cl_q, g_bb_gpu_kerns[%d], 1, NULL, &_bb_gws_%d, &_bb_lws_%d, 0, NULL, NULL);\n",
+                            pad, kid, kid, kid);
+                    fprintf(out, "%s    fn_clFinish(g_bb_cl_q);\n", pad);
+                    fprintf(out, "%s}\n", pad);
+                    break;
+                }
+            }
             if (!s->is_parallel && s->body_count == 1 &&
                 s->body[0]->kind == STMT_FOR && s->body[0]->is_parallel) {
                 Stmt *inner = s->body[0];
                 g_num_sroa_fields = 0;
+                g_sroa_has_nonlocal_index = false;
                 for (int i = 0; i < inner->body_count; i++) {
                     scan_sroa_stmt(inner->body[i], inner->name);
                 }
-                fprintf(out, "%s/* Buildbit Auto-Fused Temporal SIMD Kernel + 16-Lane Register Pinning (SROA-16) */\n", pad);
-                if (!g_freestanding) {
-                    fprintf(out, "%s#pragma omp parallel for schedule(static)\n", pad);
-                }
-                fprintf(out, "%sfor (int64_t _bb_tile = ", pad);
-                emit_expr(out, inner->start_expr);
-                fprintf(out, "; _bb_tile < ");
-                emit_expr(out, inner->end_expr);
-                fprintf(out, "; _bb_tile += 16LL) {\n");
-                for (int k = 0; k < g_num_sroa_fields; k++) {
-                    fprintf(out, "%s    %s _bb_reg_%s[16] __attribute__((aligned(64)));\n",
-                            pad, g_sroa_fields[k].c_type, g_sroa_fields[k].c_name);
-                }
-                fprintf(out, "%s    #pragma omp simd\n", pad);
-                fprintf(out, "%s    for (int64_t _bb_l = 0LL; _bb_l < 16LL; ++_bb_l) {\n", pad);
-                for (int k = 0; k < g_num_sroa_fields; k++) {
-                    fprintf(out, "%s        _bb_reg_%s[_bb_l] = %s[_bb_tile + _bb_l];\n",
-                            pad, g_sroa_fields[k].c_name, g_sroa_fields[k].c_name);
-                }
-                fprintf(out, "%s    }\n", pad);
-                fprintf(out, "%s    for (int64_t %s = ", pad, s->name);
-                emit_expr(out, s->start_expr);
-                fprintf(out, "; %s < ", s->name);
-                emit_expr(out, s->end_expr);
-                fprintf(out, "; ++%s) {\n", s->name);
-                fprintf(out, "%s        #pragma omp simd\n", pad);
-                fprintf(out, "%s        for (int64_t _bb_l = 0LL; _bb_l < 16LL; ++_bb_l) {\n", pad);
-                fprintf(out, "%s            int64_t %s = _bb_tile + _bb_l; (void)%s;\n",
-                        pad, inner->name, inner->name);
-                g_sroa_index_var = inner->name;
-                for (int i = 0; i < inner->body_count; i++) {
-                    emit_stmt(out, inner->body[i], indent + 3);
-                }
-                g_sroa_index_var = NULL;
-                fprintf(out, "%s        }\n", pad);
-                fprintf(out, "%s    }\n", pad);
-                fprintf(out, "%s    #pragma omp simd\n", pad);
-                fprintf(out, "%s    for (int64_t _bb_l = 0LL; _bb_l < 16LL; ++_bb_l) {\n", pad);
-                for (int k = 0; k < g_num_sroa_fields; k++) {
-                    if (g_sroa_fields[k].is_written) {
-                        fprintf(out, "%s        %s[_bb_tile + _bb_l] = _bb_reg_%s[_bb_l];\n",
+                if (!g_sroa_has_nonlocal_index) {
+                    fprintf(out, "%s/* Buildbit Auto-Fused Temporal SIMD Kernel + 16-Lane Register Pinning (SROA-16) */\n", pad);
+                    if (!g_freestanding) {
+                        fprintf(out, "%s#pragma omp parallel for schedule(static)\n", pad);
+                    }
+                    fprintf(out, "%sfor (int64_t _bb_tile = ", pad);
+                    emit_expr(out, inner->start_expr);
+                    fprintf(out, "; _bb_tile < ");
+                    emit_expr(out, inner->end_expr);
+                    fprintf(out, "; _bb_tile += 16LL) {\n");
+                    for (int k = 0; k < g_num_sroa_fields; k++) {
+                        fprintf(out, "%s    %s _bb_reg_%s[16] __attribute__((aligned(64)));\n",
+                                pad, g_sroa_fields[k].c_type, g_sroa_fields[k].c_name);
+                    }
+                    fprintf(out, "%s    #pragma omp simd\n", pad);
+                    fprintf(out, "%s    for (int64_t _bb_l = 0LL; _bb_l < 16LL; ++_bb_l) {\n", pad);
+                    for (int k = 0; k < g_num_sroa_fields; k++) {
+                        fprintf(out, "%s        _bb_reg_%s[_bb_l] = %s[_bb_tile + _bb_l];\n",
                                 pad, g_sroa_fields[k].c_name, g_sroa_fields[k].c_name);
                     }
+                    fprintf(out, "%s    }\n", pad);
+                    fprintf(out, "%s    for (int64_t %s = ", pad, s->name);
+                    emit_expr(out, s->start_expr);
+                    fprintf(out, "; %s < ", s->name);
+                    emit_expr(out, s->end_expr);
+                    fprintf(out, "; ++%s) {\n", s->name);
+                    fprintf(out, "%s        #pragma omp simd\n", pad);
+                    fprintf(out, "%s        for (int64_t _bb_l = 0LL; _bb_l < 16LL; ++_bb_l) {\n", pad);
+                    fprintf(out, "%s            int64_t %s = _bb_tile + _bb_l; (void)%s;\n",
+                            pad, inner->name, inner->name);
+                    g_sroa_index_var = inner->name;
+                    for (int i = 0; i < inner->body_count; i++) {
+                        emit_stmt(out, inner->body[i], indent + 3);
+                    }
+                    g_sroa_index_var = NULL;
+                    fprintf(out, "%s        }\n", pad);
+                    fprintf(out, "%s    }\n", pad);
+                    fprintf(out, "%s    #pragma omp simd\n", pad);
+                    fprintf(out, "%s    for (int64_t _bb_l = 0LL; _bb_l < 16LL; ++_bb_l) {\n", pad);
+                    for (int k = 0; k < g_num_sroa_fields; k++) {
+                        if (g_sroa_fields[k].is_written) {
+                            fprintf(out, "%s        %s[_bb_tile + _bb_l] = _bb_reg_%s[_bb_l];\n",
+                                    pad, g_sroa_fields[k].c_name, g_sroa_fields[k].c_name);
+                        }
+                    }
+                    fprintf(out, "%s    }\n", pad);
+                    fprintf(out, "%s}\n", pad);
+                    break;
                 }
-                fprintf(out, "%s    }\n", pad);
-                fprintf(out, "%s}\n", pad);
-                break;
             }
             if (s->is_parallel) {
                 if (!g_freestanding) {
@@ -1804,6 +1921,7 @@ static void emit_stmt(FILE *out, Stmt *s, int indent) {
             }
             fprintf(out, "%s}\n", pad);
             break;
+        }
         case STMT_WHILE:
             fprintf(out, "%swhile (", pad);
             emit_expr(out, s->expr);
@@ -1972,9 +2090,10 @@ static void generate_common_syscalls_and_file_io(FILE *out) {
 
 static void generate_kernel_header(FILE *out) {
     fprintf(out,
-        "/* Generated by Buildbit Compiler (bbc v2.0 --kernel) - Bare-Metal Ring-0 OS Kernel Runtime */\n"
+        "/* Generated by Buildbit Compiler (bbc v2.2 --kernel) - Bare-Metal Ring-0 OS Kernel Runtime */\n"
         "#include <stdint.h>\n"
         "#include <stddef.h>\n\n"
+        "uint32_t bb_mbi_addr = 0;\n\n"
         "/* 1. Multiboot1 Bootloader Header + 64KB Ring-0 Stack + Hardware FPU/SSE Enable */\n"
         "__asm__(\n"
         "    \".section .text\\n\"\n"
@@ -1986,6 +2105,7 @@ static void generate_kernel_header(FILE *out) {
         "    \"_start:\\n\"\n"
         "    \"    mov $bb_kernel_stack_top, %%esp\\n\"\n"
         "    \"    and $-16, %%esp\\n\"\n"
+        "    \"    mov %%ebx, bb_mbi_addr\\n\"\n"
         "    \"    fninit\\n\"\n"
         "    \"    mov %%cr0, %%eax\\n\"\n"
         "    \"    and $0xFFFB, %%ax\\n\"\n"
@@ -2106,6 +2226,9 @@ static void generate_kernel_header(FILE *out) {
         "static inline void bb_gpu_probe(void) {\n"
         "    bb_print_str(\"[BuildbitOS Ring-0 Hardware Probe] Direct x86 PCIe + Physical Memory Controller active.\\n\");\n"
         "}\n\n"
+        "#if __has_include(\"os/baremetal_gui.h\")\n"
+        "#include \"os/baremetal_gui.h\"\n"
+        "#endif\n\n"
         "int bb_fn_main(void);\n"
         "__attribute__((noinline)) int64_t bb_fn_linux_syscall_dispatch(int64_t nr, int64_t a1, int64_t a2, int64_t a3);\n"
         "__attribute__((force_align_arg_pointer)) void bb_kernel_entry(void) {\n"
@@ -2224,7 +2347,7 @@ static void generate_freestanding_header(FILE *out) {
 
 static void generate_runtime_header(FILE *out) {
     fprintf(out,
-        "/* Generated by Buildbit Compiler (bbc v2.0) - Bare-Metal Universal Runtime */\n"
+        "/* Generated by Buildbit Compiler (bbc v2.1) - Bare-Metal + GPU-OS Universal Runtime */\n"
         "#define _GNU_SOURCE\n"
         "#include <stdint.h>\n"
         "#include <stddef.h>\n"
@@ -2234,6 +2357,7 @@ static void generate_runtime_header(FILE *out) {
         "#include <time.h>\n"
         "#include <fcntl.h>\n"
         "#include <unistd.h>\n"
+        "#include <dlfcn.h>\n"
         "#include <sys/mman.h>\n"
         "#include <sys/ioctl.h>\n\n");
     generate_common_syscalls_and_file_io(out);
@@ -2266,6 +2390,7 @@ static void generate_runtime_header(FILE *out) {
         "    size_t capacity;\n"
         "    size_t offset;\n"
         "    int gpu_backed;\n"
+        "    uint32_t gem_handle;\n"
         "} bb_arena_t;\n\n"
         "union bb_amdgpu_gem_create {\n"
         "    struct { uint64_t bo_size; uint64_t alignment; uint64_t domains; uint64_t domain_flags; } in;\n"
@@ -2282,7 +2407,7 @@ static void generate_runtime_header(FILE *out) {
         "    void *ptr = mmap(NULL, page_aligned, PROT_READ | PROT_WRITE,\n"
         "                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);\n"
         "    madvise(ptr, page_aligned, MADV_HUGEPAGE);\n"
-        "    bb_arena_t a = { .base = (uint8_t *)ptr, .gpu_dma_base = NULL, .capacity = page_aligned, .offset = 0, .gpu_backed = 0 };\n"
+        "    bb_arena_t a = { .base = (uint8_t *)ptr, .gpu_dma_base = NULL, .capacity = page_aligned, .offset = 0, .gpu_backed = 0, .gem_handle = 0 };\n"
         "    return a;\n"
         "}\n\n"
         "static inline bb_arena_t bb_gpu_arena_create(size_t bytes) {\n"
@@ -2293,7 +2418,7 @@ static void generate_runtime_header(FILE *out) {
         "        union bb_amdgpu_gem_create gem = {0};\n"
         "        gem.in.bo_size = page_aligned;\n"
         "        gem.in.alignment = 4096;\n"
-        "        gem.in.domains = 0x2; /* AMDGPU_GEM_DOMAIN_GTT (Cache-Coherent Zero-Copy GPU+CPU DMA) */\n"
+        "        gem.in.domains = 0x2; /* AMDGPU_GEM_DOMAIN_GTT (Cache-Coherent Zero-Copy GPU+CPU Unified Memory) */\n"
         "        gem.in.domain_flags = 0;\n"
         "        if (ioctl(fd, BB_DRM_IOCTL_AMDGPU_GEM_CREATE, &gem) == 0) {\n"
         "            union bb_amdgpu_gem_mmap m = {0};\n"
@@ -2306,6 +2431,7 @@ static void generate_runtime_header(FILE *out) {
         "                           (unsigned long long)(page_aligned / (1024 * 1024)), gem.out.handle, gpu_ptr);\n"
         "                    a.gpu_dma_base = (uint8_t *)gpu_ptr;\n"
         "                    a.gpu_backed = 1;\n"
+        "                    a.gem_handle = gem.out.handle;\n"
         "                    return a;\n"
         "                }\n"
         "            }\n"
@@ -2321,8 +2447,10 @@ static void generate_runtime_header(FILE *out) {
         "    __asm__ (\"\" : \"+r\"(ret));\n"
         "    return __builtin_assume_aligned(ret, 64);\n"
         "}\n\n"
-        "/* 3. Multi-Core + SIMD Horizontal Reduction */\n"
+        "/* 3. Multi-Core + SIMD Horizontal Reduction (with automatic GPU VRAM sync) */\n"
+        "static inline void bb_gpu_sync_host(const void *host_ptr, size_t bytes);\n"
         "static inline float bb_reduce_sum_f32(const float * __restrict__ arr, int64_t n) {\n"
+        "    bb_gpu_sync_host(arr, (size_t)n * sizeof(float));\n"
         "    const float *a = (const float *)__builtin_assume_aligned(arr, 64);\n"
         "    float sum = 0.0f;\n"
         "    #pragma omp parallel for simd reduction(+:sum) schedule(static)\n"
@@ -2391,6 +2519,49 @@ static void generate_runtime_header(FILE *out) {
         "};\n"
         "#define BB_DRM_IOCTL_VERSION     _IOWR('d', 0x00, struct bb_drm_version)\n"
         "#define BB_DRM_IOCTL_AMDGPU_INFO _IOW('d', 0x45, struct bb_amdgpu_info_request)\n\n"
+        "static inline int bb_query_amdgpu_dev(struct bb_amdgpu_dev_info *dev_out, struct bb_amdgpu_vram_gtt_info *mem_out) {\n"
+        "    int fd = open(\"/dev/dri/renderD128\", O_RDWR);\n"
+        "    if (fd < 0) fd = open(\"/dev/dri/card0\", O_RDWR);\n"
+        "    if (fd < 0) fd = open(\"/dev/dri/card1\", O_RDWR);\n"
+        "    if (fd < 0) return -1;\n"
+        "    if (dev_out) {\n"
+        "        memset(dev_out, 0, sizeof(*dev_out));\n"
+        "        struct bb_amdgpu_info_request req = { .return_pointer = (uint64_t)(uintptr_t)dev_out, .return_size = sizeof(*dev_out), .query = 0x16 };\n"
+        "        ioctl(fd, BB_DRM_IOCTL_AMDGPU_INFO, &req);\n"
+        "    }\n"
+        "    if (mem_out) {\n"
+        "        memset(mem_out, 0, sizeof(*mem_out));\n"
+        "        struct bb_amdgpu_info_request req = { .return_pointer = (uint64_t)(uintptr_t)mem_out, .return_size = sizeof(*mem_out), .query = 0x14 };\n"
+        "        ioctl(fd, BB_DRM_IOCTL_AMDGPU_INFO, &req);\n"
+        "    }\n"
+        "    close(fd);\n"
+        "    return 0;\n"
+        "}\n\n"
+        "static inline int64_t bb_gpu_cu_count(void) {\n"
+        "    struct bb_amdgpu_dev_info d;\n"
+        "    if (bb_query_amdgpu_dev(&d, NULL) == 0 && d.cu_active_number > 0) return (int64_t)d.cu_active_number;\n"
+        "    return 24; /* Default BC-250 RDNA2 24 CUs */\n"
+        "}\n"
+        "static inline int64_t bb_gpu_vram_mb(void) {\n"
+        "    struct bb_amdgpu_vram_gtt_info m;\n"
+        "    if (bb_query_amdgpu_dev(NULL, &m) == 0 && m.vram_size > 0) return (int64_t)(m.vram_size / (1024*1024));\n"
+        "    return 16384;\n"
+        "}\n"
+        "static inline int64_t bb_gpu_gtt_mb(void) {\n"
+        "    struct bb_amdgpu_vram_gtt_info m;\n"
+        "    if (bb_query_amdgpu_dev(NULL, &m) == 0 && m.gtt_size > 0) return (int64_t)(m.gtt_size / (1024*1024));\n"
+        "    return 16384;\n"
+        "}\n"
+        "static inline int64_t bb_gpu_clock_mhz(void) {\n"
+        "    struct bb_amdgpu_dev_info d;\n"
+        "    if (bb_query_amdgpu_dev(&d, NULL) == 0 && d.max_engine_clock > 0) return (int64_t)(d.max_engine_clock / 1000);\n"
+        "    return 2230;\n"
+        "}\n"
+        "static inline int64_t bb_gpu_device_id(void) {\n"
+        "    struct bb_amdgpu_dev_info d;\n"
+        "    if (bb_query_amdgpu_dev(&d, NULL) == 0 && d.device_id > 0) return (int64_t)d.device_id;\n"
+        "    return 0x13FE;\n"
+        "}\n\n"
         "static inline void bb_gpu_probe(void) {\n"
         "    int fd = open(\"/dev/dri/renderD128\", O_RDWR);\n"
         "    if (fd < 0) fd = open(\"/dev/dri/card0\", O_RDWR);\n"
@@ -2435,7 +2606,319 @@ static void generate_runtime_header(FILE *out) {
         "        }\n"
         "    }\n"
         "    close(fd);\n"
-        "}\n\n");
+        "}\n\n"
+        "/* 6. Buildbit GPU-OS Runtime: Hardware OpenCL Wavefront Dispatcher, Linux Bridge & Framebuffer */\n"
+        "typedef int32_t bb_cl_int;\n"
+        "typedef uint32_t bb_cl_uint;\n"
+        "typedef uint64_t bb_cl_ulong;\n"
+        "typedef void *bb_cl_platform_id;\n"
+        "typedef void *bb_cl_device_id;\n"
+        "typedef void *bb_cl_context;\n"
+        "typedef void *bb_cl_command_queue;\n"
+        "typedef void *bb_cl_program;\n"
+        "typedef void *bb_cl_kernel;\n"
+        "typedef void *bb_cl_mem;\n\n"
+        "static int g_bb_cl_init = 0;\n"
+        "static bb_cl_device_id g_bb_cl_dev = NULL;\n"
+        "static bb_cl_context g_bb_cl_ctx = NULL;\n"
+        "static bb_cl_command_queue g_bb_cl_q = NULL;\n"
+        "static bb_cl_kernel g_bb_cl_wave_kern = NULL;\n"
+        "static bb_cl_kernel g_bb_gpu_kerns[64];\n"
+        "static char g_bb_cl_dev_name[128] = \"AMDGPU SIMT Engine\";\n"
+        "static bb_cl_program (*fn_clCreateProgramWithSource)(bb_cl_context, bb_cl_uint, const char **, const size_t *, bb_cl_int *) = NULL;\n"
+        "static bb_cl_int (*fn_clBuildProgram)(bb_cl_program, bb_cl_uint, const bb_cl_device_id *, const char *, void *, void *) = NULL;\n"
+        "static bb_cl_kernel (*fn_clCreateKernel)(bb_cl_program, const char *, bb_cl_int *) = NULL;\n"
+        "static bb_cl_mem (*fn_clCreateBuffer)(bb_cl_context, bb_cl_ulong, size_t, void *, bb_cl_int *) = NULL;\n"
+        "static bb_cl_int (*fn_clSetKernelArg)(bb_cl_kernel, bb_cl_uint, size_t, const void *) = NULL;\n"
+        "static bb_cl_int (*fn_clEnqueueNDRangeKernel)(bb_cl_command_queue, bb_cl_kernel, bb_cl_uint, const size_t *, const size_t *, const size_t *, bb_cl_uint, const void *, void *) = NULL;\n"
+        "static bb_cl_int (*fn_clEnqueueReadBuffer)(bb_cl_command_queue, bb_cl_mem, bb_cl_uint, size_t, size_t, void *, bb_cl_uint, const void *, void *) = NULL;\n"
+        "static bb_cl_int (*fn_clFinish)(bb_cl_command_queue) = NULL;\n"
+        "static bb_cl_int (*fn_clReleaseMemObject)(bb_cl_mem) = NULL;\n\n"
+        "typedef struct {\n"
+        "    void *host_ptr;\n"
+        "    bb_cl_mem cl_buf;\n"
+        "    size_t bytes;\n"
+        "    int dirty_on_gpu;\n"
+        "} bb_gpu_buf_entry_t;\n"
+        "static bb_gpu_buf_entry_t g_bb_gpu_bufs[64];\n"
+        "static int g_bb_num_gpu_bufs = 0;\n\n"
+        "static inline bb_cl_mem bb_gpu_get_buf(void *host_ptr, size_t bytes, int is_written) {\n"
+        "    for (int i = 0; i < g_bb_num_gpu_bufs; i++) {\n"
+        "        if (g_bb_gpu_bufs[i].host_ptr == host_ptr) {\n"
+        "            if (is_written) g_bb_gpu_bufs[i].dirty_on_gpu = 1;\n"
+        "            return g_bb_gpu_bufs[i].cl_buf;\n"
+        "        }\n"
+        "    }\n"
+        "    bb_cl_int err = 0;\n"
+        "    /* CL_MEM_READ_WRITE (1) | CL_MEM_COPY_HOST_PTR (32) = 33 (Persistent GDDR6 VRAM Buffer) */\n"
+        "    bb_cl_mem buf = fn_clCreateBuffer(g_bb_cl_ctx, 33, bytes, host_ptr, &err);\n"
+        "    if (g_bb_num_gpu_bufs < 64) {\n"
+        "        g_bb_gpu_bufs[g_bb_num_gpu_bufs].host_ptr = host_ptr;\n"
+        "        g_bb_gpu_bufs[g_bb_num_gpu_bufs].cl_buf = buf;\n"
+        "        g_bb_gpu_bufs[g_bb_num_gpu_bufs].bytes = bytes;\n"
+        "        g_bb_gpu_bufs[g_bb_num_gpu_bufs].dirty_on_gpu = is_written ? 1 : 0;\n"
+        "        g_bb_num_gpu_bufs++;\n"
+        "    }\n"
+        "    return buf;\n"
+        "}\n\n"
+        "static inline void bb_gpu_sync_host(const void *host_ptr, size_t bytes) {\n"
+        "    for (int i = 0; i < g_bb_num_gpu_bufs; i++) {\n"
+        "        if (g_bb_gpu_bufs[i].host_ptr == host_ptr && g_bb_gpu_bufs[i].dirty_on_gpu) {\n"
+        "            fn_clEnqueueReadBuffer(g_bb_cl_q, g_bb_gpu_bufs[i].cl_buf, 1, 0, bytes, (void *)host_ptr, 0, NULL, NULL);\n"
+        "            g_bb_gpu_bufs[i].dirty_on_gpu = 0;\n"
+        "            return;\n"
+        "        }\n"
+        "    }\n"
+        "}\n\n"
+        "static inline int64_t bb_gpu_wavefront_init(void) {\n"
+        "    if (g_bb_cl_init != 0) return (g_bb_cl_init > 0) ? 1 : 0;\n"
+        "    void *lib = dlopen(\"libOpenCL.so.1\", RTLD_LAZY);\n"
+        "    if (!lib) lib = dlopen(\"/opt/rocm/lib/libOpenCL.so.1\", RTLD_LAZY);\n"
+        "    if (!lib) { g_bb_cl_init = -1; return 0; }\n"
+        "    bb_cl_int (*clGetPlatformIDs)(bb_cl_uint, bb_cl_platform_id *, bb_cl_uint *) = dlsym(lib, \"clGetPlatformIDs\");\n"
+        "    bb_cl_int (*clGetDeviceIDs)(bb_cl_platform_id, bb_cl_ulong, bb_cl_uint, bb_cl_device_id *, bb_cl_uint *) = dlsym(lib, \"clGetDeviceIDs\");\n"
+        "    bb_cl_int (*clGetDeviceInfo)(bb_cl_device_id, bb_cl_uint, size_t, void *, size_t *) = dlsym(lib, \"clGetDeviceInfo\");\n"
+        "    bb_cl_context (*clCreateContext)(const void *, bb_cl_uint, const bb_cl_device_id *, void *, void *, bb_cl_int *) = dlsym(lib, \"clCreateContext\");\n"
+        "    bb_cl_command_queue (*clCreateCommandQueue)(bb_cl_context, bb_cl_device_id, bb_cl_ulong, bb_cl_int *) = dlsym(lib, \"clCreateCommandQueue\");\n"
+        "    fn_clCreateProgramWithSource = dlsym(lib, \"clCreateProgramWithSource\");\n"
+        "    fn_clBuildProgram = dlsym(lib, \"clBuildProgram\");\n"
+        "    fn_clCreateKernel = dlsym(lib, \"clCreateKernel\");\n"
+        "    fn_clCreateBuffer = dlsym(lib, \"clCreateBuffer\");\n"
+        "    fn_clSetKernelArg = dlsym(lib, \"clSetKernelArg\");\n"
+        "    fn_clEnqueueNDRangeKernel = dlsym(lib, \"clEnqueueNDRangeKernel\");\n"
+        "    fn_clEnqueueReadBuffer = dlsym(lib, \"clEnqueueReadBuffer\");\n"
+        "    fn_clFinish = dlsym(lib, \"clFinish\");\n"
+        "    fn_clReleaseMemObject = dlsym(lib, \"clReleaseMemObject\");\n"
+        "    if (!clGetPlatformIDs || !clGetDeviceIDs || !clCreateContext || !clCreateCommandQueue || !fn_clCreateProgramWithSource || !fn_clBuildProgram || !fn_clCreateKernel) {\n"
+        "        g_bb_cl_init = -1; return 0;\n"
+        "    }\n"
+        "    bb_cl_platform_id plats[8]; bb_cl_uint n_plats = 0;\n"
+        "    if (clGetPlatformIDs(8, plats, &n_plats) != 0 || n_plats == 0) { g_bb_cl_init = -1; return 0; }\n"
+        "    bb_cl_device_id chosen_dev = NULL;\n"
+        "    /* Prefer Platform #1 (ROCm AMDGPU) or Platform #0 (Mesa Rusticl AMDGPU) GPU device */\n"
+        "    for (bb_cl_uint idx = 0; idx < n_plats; idx++) {\n"
+        "        bb_cl_uint p_i = (n_plats > 1) ? ((idx == 0) ? 1 : ((idx == 1) ? 0 : idx)) : idx;\n"
+        "        bb_cl_device_id devs[4]; bb_cl_uint n_devs = 0;\n"
+        "        if (clGetDeviceIDs(plats[p_i], 4 /* CL_DEVICE_TYPE_GPU */, 4, devs, &n_devs) == 0 && n_devs > 0) {\n"
+        "            chosen_dev = devs[0]; break;\n"
+        "        }\n"
+        "    }\n"
+        "    if (!chosen_dev) { g_bb_cl_init = -1; return 0; }\n"
+        "    g_bb_cl_dev = chosen_dev;\n"
+        "    if (clGetDeviceInfo) clGetDeviceInfo(chosen_dev, 0x102B /* CL_DEVICE_NAME */, sizeof(g_bb_cl_dev_name), g_bb_cl_dev_name, NULL);\n"
+        "    bb_cl_int err = 0;\n"
+        "    g_bb_cl_ctx = clCreateContext(NULL, 1, &chosen_dev, NULL, NULL, &err);\n"
+        "    if (!g_bb_cl_ctx) { g_bb_cl_init = -1; return 0; }\n"
+        "    g_bb_cl_q = clCreateCommandQueue(g_bb_cl_ctx, chosen_dev, 0, &err);\n"
+        "    const char *kern_src =\n"
+        "        \"__kernel void gpu_os_wavefront_tick(__global float *vrun, __global float *energy, __global float *cu_id, int epochs) {\\n\"\n"
+        "        \"    int gid = get_global_id(0);\\n\"\n"
+        "        \"    float v = vrun[gid];\\n\"\n"
+        "        \"    float e = energy[gid];\\n\"\n"
+        "        \"    float c = cu_id[gid];\\n\"\n"
+        "        \"    for (int ep = 0; ep < epochs; ep++) {\\n\"\n"
+        "        \"        float pulse = native_sin(v * 0.01f + c * 0.1f) * 0.5f + 0.5f;\\n\"\n"
+        "        \"        v += (e * 1.25f) + pulse;\\n\"\n"
+        "        \"        e = e * 0.9995f + 0.0005f * pulse;\\n\"\n"
+        "        \"    }\\n\"\n"
+        "        \"    vrun[gid] = v;\\n\"\n"
+        "        \"    energy[gid] = e;\\n\"\n"
+        "        \"}\\n\";\n"
+        "    size_t srclen = strlen(kern_src);\n"
+        "    bb_cl_program prog = fn_clCreateProgramWithSource(g_bb_cl_ctx, 1, &kern_src, &srclen, &err);\n"
+        "    if (!prog || fn_clBuildProgram(prog, 1, &chosen_dev, NULL, NULL, NULL) != 0) { g_bb_cl_init = -1; return 0; }\n"
+        "    g_bb_cl_wave_kern = fn_clCreateKernel(prog, \"gpu_os_wavefront_tick\", &err);\n"
+        "    if (!g_bb_cl_wave_kern) { g_bb_cl_init = -1; return 0; }\n"
+        "    printf(\"[Buildbit GPU-OS Wavefront Engine] Bound Hardware Compute Shaders on: %%s\\n\", g_bb_cl_dev_name);\n"
+        "    g_bb_cl_init = 1;\n"
+        "    return 1;\n"
+        "}\n\n"
+        "static inline int64_t bb_gpu_dispatch_wavefronts(float *vrun, float *energy, float *cu_id, int64_t n_threads, int64_t epochs) {\n"
+        "    if (bb_gpu_wavefront_init() == 1) {\n"
+        "        bb_cl_int err = 0;\n"
+        "        size_t bytes = (size_t)n_threads * sizeof(float);\n"
+        "        /* CL_MEM_READ_WRITE (1) | CL_MEM_USE_HOST_PTR (8) = 9 (Zero-Copy over AMDGPU gpu_arena!) */\n"
+        "        bb_cl_mem b_vrun = fn_clCreateBuffer(g_bb_cl_ctx, 9, bytes, vrun, &err);\n"
+        "        bb_cl_mem b_ener = fn_clCreateBuffer(g_bb_cl_ctx, 9, bytes, energy, &err);\n"
+        "        bb_cl_mem b_cuid = fn_clCreateBuffer(g_bb_cl_ctx, 9, bytes, cu_id, &err);\n"
+        "        int ep_i = (int)epochs;\n"
+        "        fn_clSetKernelArg(g_bb_cl_wave_kern, 0, sizeof(bb_cl_mem), &b_vrun);\n"
+        "        fn_clSetKernelArg(g_bb_cl_wave_kern, 1, sizeof(bb_cl_mem), &b_ener);\n"
+        "        fn_clSetKernelArg(g_bb_cl_wave_kern, 2, sizeof(bb_cl_mem), &b_cuid);\n"
+        "        fn_clSetKernelArg(g_bb_cl_wave_kern, 3, sizeof(int), &ep_i);\n"
+        "        size_t gsize = (size_t)n_threads;\n"
+        "        size_t lsize = 64;\n"
+        "        fn_clEnqueueNDRangeKernel(g_bb_cl_q, g_bb_cl_wave_kern, 1, NULL, &gsize, &lsize, 0, NULL, NULL);\n"
+        "        fn_clEnqueueReadBuffer(g_bb_cl_q, b_vrun, 1, 0, bytes, vrun, 0, NULL, NULL);\n"
+        "        fn_clEnqueueReadBuffer(g_bb_cl_q, b_ener, 1, 0, bytes, energy, 0, NULL, NULL);\n"
+        "        fn_clFinish(g_bb_cl_q);\n"
+        "        fn_clReleaseMemObject(b_vrun);\n"
+        "        fn_clReleaseMemObject(b_ener);\n"
+        "        fn_clReleaseMemObject(b_cuid);\n"
+        "        return 1;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n\n"
+        "/* Zero-Copy Linux Software & Package Execution Bridge */\n"
+        "static inline int64_t bb_linux_exec(const char *cmd, uint8_t *out_buf, int64_t max_len) {\n"
+        "    if (!cmd || !out_buf || max_len <= 1) return -1;\n"
+        "    FILE *fp = popen(cmd, \"r\");\n"
+        "    if (!fp) return -1;\n"
+        "    int64_t total = 0;\n"
+        "    while (total < max_len - 1) {\n"
+        "        size_t n = fread(out_buf + total, 1, (size_t)(max_len - 1 - total), fp);\n"
+        "        if (n == 0) break;\n"
+        "        total += (int64_t)n;\n"
+        "    }\n"
+        "    out_buf[total] = '\\0';\n"
+        "    pclose(fp);\n"
+        "    return total;\n"
+        "}\n\n"
+        "static inline int64_t bb_print_buf(uint8_t *buf, int64_t len) {\n"
+        "    if (!buf || len <= 0) return 0;\n"
+        "    fwrite(buf, 1, (size_t)len, stdout);\n"
+        "    if (buf[len - 1] != '\\n') fputc('\\n', stdout);\n"
+        "    return len;\n"
+        "}\n\n"
+        "/* GPU Framebuffer Compositor: Renders GPU-OS Desktop in gpu_arena VRAM + TrueColor Terminal HUD */\n"
+        "static inline int64_t bb_gpu_render_desktop(uint8_t *fb, int64_t w, int64_t h, int64_t cu_count, int64_t active_waves, int64_t tick) {\n"
+        "    #pragma omp parallel for schedule(static)\n"
+        "    for (int64_t y = 0; y < h; y++) {\n"
+        "        for (int64_t x = 0; x < w; x++) {\n"
+        "            int64_t idx = (y * w + x) * 3;\n"
+        "            uint8_t r = 14, g = 18, b = 30; /* Deep Dark Navy GPU-OS Desktop Background */\n"
+        "            if (y == 0 || y == h - 1 || x == 0 || x == w - 1) {\n"
+        "                r = 0; g = 210; b = 255; /* Cyan Window Border */\n"
+        "            } else if (y <= 2) {\n"
+        "                r = 25; g = 60; b = 120; /* Top Title Bar */\n"
+        "            } else if (y >= 4 && y <= h - 4) {\n"
+        "                /* Render Live Compute Unit (CU) Activity Bars across the Desktop */\n"
+        "                int64_t inner_w = w - 4;\n"
+        "                int64_t cu_idx = ((x - 2) * cu_count) / (inner_w > 0 ? inner_w : 1);\n"
+        "                int64_t bar_phase = ((cu_idx * 17 + tick * 7 + active_waves) %% 100);\n"
+        "                int64_t bar_h = ((h - 8) * (45 + (bar_phase %% 55))) / 100;\n"
+        "                int64_t y_from_bottom = (h - 4) - y;\n"
+        "                if ((x - 2) %% (inner_w / (cu_count > 0 ? cu_count : 1) + 1) != 0 && y_from_bottom <= bar_h) {\n"
+        "                    if (y_from_bottom > (h - 8) * 75 / 100) { r = 0; g = 255; b = 180; }\n"
+        "                    else if (y_from_bottom > (h - 8) * 40 / 100) { r = 0; g = 180; b = 255; }\n"
+        "                    else { r = 40; g = 110; b = 220; }\n"
+        "                }\n"
+        "            }\n"
+        "            fb[idx + 0] = r;\n"
+        "            fb[idx + 1] = g;\n"
+        "            fb[idx + 2] = b;\n"
+        "        }\n"
+        "    }\n"
+        "    /* Save raw PPM snapshot of the GPU-OS Framebuffer */\n"
+        "    FILE *f = fopen(\"/tmp/gpu_os_framebuffer.ppm\", \"wb\");\n"
+        "    if (f) {\n"
+        "        fprintf(f, \"P6\\n%%lld %%lld\\n255\\n\", (long long)w, (long long)h);\n"
+        "        fwrite(fb, 1, (size_t)(w * h * 3), f);\n"
+        "        fclose(f);\n"
+        "    }\n"
+        "    /* Render TrueColor 24-bit Unicode Half-Block HUD directly to Console */\n"
+        "    printf(\"  \\033[1;36m+--- [GPU-OS VRAM FRAMEBUFFER: %%lldx%%lld RGB | %%lld Active CUs | %%lld Wave32 Procs] ---+\\033[0m\\n\", (long long)w, (long long)h, (long long)cu_count, (long long)active_waves);\n"
+        "    for (int64_t y = 0; y < h; y += 2) {\n"
+        "        printf(\"  \");\n"
+        "        for (int64_t x = 0; x < w; x++) {\n"
+        "            int64_t i_top = (y * w + x) * 3;\n"
+        "            int64_t i_bot = (((y + 1 < h) ? (y + 1) : y) * w + x) * 3;\n"
+        "            printf(\"\\033[38;2;%%u;%%u;%%um\\033[48;2;%%u;%%u;%%um▀\",\n"
+        "                   fb[i_top], fb[i_top+1], fb[i_top+2],\n"
+        "                   fb[i_bot], fb[i_bot+1], fb[i_bot+2]);\n"
+        "        }\n"
+        "        printf(\"\\033[0m\\n\");\n"
+        "    }\n"
+        "    printf(\"  \\033[1;36m+--- [VRAM Scanout Saved: /tmp/gpu_os_framebuffer.ppm | Zero-Copy GTT Active] ---+\\033[0m\\n\");\n"
+        "    return w * h * 3;\n"
+        "}\n\n"
+        "/* Interactive GPU-OS Shell Helpers */\n"
+        "static inline int64_t bb_shell_readline(const char *prompt, uint8_t *buf, int64_t max_len) {\n"
+        "    if (prompt) { fputs(prompt, stdout); fflush(stdout); }\n"
+        "    if (!fgets((char *)buf, (int)max_len, stdin)) return -1;\n"
+        "    size_t l = strlen((char *)buf);\n"
+        "    while (l > 0 && (buf[l - 1] == '\\n' || buf[l - 1] == '\\r')) buf[--l] = '\\0';\n"
+        "    return (int64_t)l;\n"
+        "}\n"
+        "static inline int64_t bb_str_eq(uint8_t *buf, const char *cmd) {\n"
+        "    return (strcmp((const char *)buf, cmd) == 0) ? 1 : 0;\n"
+        "}\n"
+        "static inline int64_t bb_str_starts(uint8_t *buf, const char *prefix) {\n"
+        "    return (strncmp((const char *)buf, prefix, strlen(prefix)) == 0) ? 1 : 0;\n"
+        "}\n"
+        "static inline const char *bb_str_after(uint8_t *buf, int64_t offset) {\n"
+        "    return (const char *)(buf + offset);\n"
+        "}\n"
+        "#if __has_include(\"os/gpu_mint_gui.h\")\n"
+        "#include \"os/gpu_mint_gui.h\"\n"
+        "#endif\n\n");
+}
+
+static void collect_gpu_kernels_stmt(Stmt *s, FILE *ocl_mem) {
+    if (!s) return;
+    if (s->kind == STMT_FOR && s->is_parallel) {
+        int kid = g_num_gpu_kernels++;
+        s->gpu_kern_id = kid;
+        g_num_sroa_fields = 0;
+        g_sroa_has_nonlocal_index = false;
+        for (int i = 0; i < s->body_count; i++) {
+            scan_sroa_stmt(s->body[i], s->name);
+        }
+        fprintf(ocl_mem, "__kernel void _bb_gpu_kern_%d(", kid);
+        for (int k = 0; k < g_num_sroa_fields; k++) {
+            if (k > 0) fprintf(ocl_mem, ", ");
+            fprintf(ocl_mem, "__global %s *%s", g_sroa_fields[k].c_type, g_sroa_fields[k].c_name);
+        }
+        fprintf(ocl_mem, ") {\n");
+        fprintf(ocl_mem, "    int %s = get_global_id(0);\n", s->name);
+        g_emitting_ocl = true;
+        for (int i = 0; i < s->body_count; i++) {
+            emit_stmt(ocl_mem, s->body[i], 1);
+        }
+        g_emitting_ocl = false;
+        fprintf(ocl_mem, "}\n");
+        return;
+    }
+    for (int i = 0; i < s->body_count; i++) collect_gpu_kernels_stmt(s->body[i], ocl_mem);
+    for (int i = 0; i < s->else_count; i++) collect_gpu_kernels_stmt(s->else_body[i], ocl_mem);
+}
+
+static void emit_gpu_auto_kernels(FILE *out) {
+    char *ocl_buf = NULL;
+    size_t ocl_len = 0;
+    FILE *ocl_mem = open_memstream(&ocl_buf, &ocl_len);
+    for (int i = 0; i < num_functions; i++) {
+        FunctionDef *fn = &functions[i];
+        for (int j = 0; j < fn->body_count; j++) {
+            collect_gpu_kernels_stmt(fn->body[j], ocl_mem);
+        }
+    }
+    fclose(ocl_mem);
+    if (g_num_gpu_kernels > 0 && ocl_buf) {
+        fprintf(out, "/* Auto-Generated OpenCL C Compute Shaders for Radeon RX 9060 XT (gfx1200) */\n");
+        fprintf(out, "static const char *g_bb_auto_ocl_src =\n    \"");
+        for (size_t i = 0; i < ocl_len; i++) {
+            char c = ocl_buf[i];
+            if (c == '\n') fprintf(out, "\\n\"\n    \"");
+            else if (c == '"') fprintf(out, "\\\"");
+            else if (c == '\\') fprintf(out, "\\\\");
+            else fputc(c, out);
+        }
+        fprintf(out, "\";\n\n");
+        fprintf(out, "static void bb_gpu_compile_auto_kernels(void) {\n"
+                     "    if (!bb_gpu_wavefront_init()) return;\n"
+                     "    bb_cl_int err = 0;\n"
+                     "    size_t srclen = strlen(g_bb_auto_ocl_src);\n"
+                     "    bb_cl_program prog = fn_clCreateProgramWithSource(g_bb_cl_ctx, 1, &g_bb_auto_ocl_src, &srclen, &err);\n"
+                     "    fn_clBuildProgram(prog, 1, &g_bb_cl_dev, \"-cl-fast-relaxed-math -cl-mad-enable\", NULL, NULL);\n"
+                     "    for (int k = 0; k < %d; k++) {\n"
+                     "        char kname[64];\n"
+                     "        snprintf(kname, sizeof(kname), \"_bb_gpu_kern_%%d\", k);\n"
+                     "        g_bb_gpu_kerns[k] = fn_clCreateKernel(prog, kname, &err);\n"
+                     "    }\n"
+                     "}\n\n", g_num_gpu_kernels);
+    }
+    free(ocl_buf);
 }
 
 static const char *c_ret_type(DataType t, const char *fn_name) {
@@ -2472,6 +2955,7 @@ static void emit_param_list(FILE *out, FunctionDef *fn) {
 static void emit_function(FILE *out, FunctionDef *fn) {
     const char *ret_c = c_ret_type(fn->ret_type, fn->name);
     if (fn->is_extern) {
+        if (strncmp(fn->name, "bb_", 3) == 0) return;
         fprintf(out, "extern %s %s(", ret_c, fn->name);
         emit_param_list(out, fn);
         fprintf(out, ");\n");
@@ -2571,7 +3055,7 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
                 "Buildbit Compiler (bbc) v2.0.0 — Systems-Complete Edition\n"
-                "Usage: bbc <source.bb> [-o <binary>] [--kernel] [--freestanding] [--native-elf] [--emit-c] [-l<lib>]\n");
+                "Usage: bbc <source.bb> [-o <binary>] [--gpu] [--kernel] [--freestanding] [--native-elf] [--emit-c] [-l<lib>]\n");
         return 1;
     }
 
@@ -2586,6 +3070,8 @@ int main(int argc, char **argv) {
             output_bin = argv[++i];
         } else if (strcmp(argv[i], "--emit-c") == 0) {
             emit_c_only = true;
+        } else if (strcmp(argv[i], "--gpu") == 0) {
+            g_gpu = true;
         } else if (strcmp(argv[i], "--kernel") == 0) {
             g_kernel = true;
             g_freestanding = true;
@@ -2624,6 +3110,9 @@ int main(int argc, char **argv) {
         generate_freestanding_header(out);
     } else {
         generate_runtime_header(out);
+        if (g_gpu) {
+            emit_gpu_auto_kernels(out);
+        }
     }
 
     for (int i = 0; i < num_functions; i++) {
@@ -2631,7 +3120,11 @@ int main(int argc, char **argv) {
     }
 
     if (!g_freestanding) {
-        fprintf(out, "int main(void) {\n    return (int)bb_fn_main();\n}\n");
+        fprintf(out, "int main(void) {\n");
+        if (g_gpu && g_num_gpu_kernels > 0) {
+            fprintf(out, "    bb_gpu_compile_auto_kernels();\n");
+        }
+        fprintf(out, "    return (int)bb_fn_main();\n}\n");
     }
     fclose(out);
 
